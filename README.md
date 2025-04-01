@@ -1,2 +1,2 @@
 # IsoFrac
- Proteinfractionation based isoform proteomics. This collection facilatets the analysis of fractionated bottom up proteomics datasets.
+ Proteinfractionation based isoform proteomics. This collection facilatates the analysis of fractionated bottom up proteomics datasets.
