@@ -1,0 +1,1700 @@
+---
+title: "Isofrac_PeakFinder"
+author: "Henrik Zauber"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# ISOFRAC PeakFinder Module
+## Purpose
+-  finding peaks within clusters defined by hdbscan
+  -  Cluster FDR
+-  building networks of Isofrac Peaks and Database Genes based on intersecting peptides sequences
+  -  Enrichement analysis
+  -  Similarity between nodes
+  -  FDR analysis (random network vs real network)
+
+## Initialization  
+
+```{r Initiation}
+dir.create("./Peakfinder7")
+  setwd("./Peakfinder7")
+  ProteinSequences <- readRDS("../Protein_ENSG_Reference_HS-UP000005640-2021_gff.rds")
+SemiTryptic <- F
+if(SemiTryptic){
+  setwd("E:/MaxQuant/HZ/20230327_isofrac_semitryptic/Peakfinder")
+}
+# ProteinSequences <- load("../ProteinSequences_UPproteolytic_PacBio.rda")
+# ProteinSequences2 <- UniSequences_all
+library(data.table)
+library(ggplot2)
+library(igraph)
+library(parallel)
+library(igraph)
+library(pROC)
+library(h2o)
+library(ggplot2)
+getwd()
+setwd_knit <- function(x){knitr::opts_knit$set(root.dir = x )}
+# path <- "../IsoFracCompiler2/Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda"
+path <- "../IsoFracCompiler2/Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda"
+
+if(!exists("TableListNormEnsHdbScanMW_noSeq_noMD")){
+  hu <-load(path)
+  file.info(path)
+  table(TableListNormEnsHdbScanMW_noSeq_noMD[[2]]$InputTable$SearchSpecificity)
+}
+# check Search Fraction
+lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){table(x$InputTable$SearchSpecificity)})
+
+lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){c(x$gel,x$xname,grep("Experiment",colnames(x$InputTable),value=T))})
+
+
+TableListNormEnsHdbScanMW_noSeq_noMD <- lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){
+  if(length(x$hdbscanTables$cl_2_backup)==0){
+    print("Preparing Cluster Names")
+    x$hdbscanTables$cl_2_backup <- x$hdbscanTables$cl_2
+  x$hdbscanTables$cl_2 <- x$hdbscanTables$BestCluster
+  
+   x$hdbscanTables_random$cl_2_backup <- x$hdbscanTables_random$cl_2
+  x$hdbscanTables_random$cl_2 <- x$hdbscanTables_random$BestCluster
+  }else{
+    print("FOUND cl_2_backup entry")
+  }
+  x
+})
+
+print(paste("loaded dataset created at",file.info(path)$mtime))
+
+# TableListNormEnsHdbScanMW_Peaks_hdb <- TableListNormEnsHdbScanMW_Peaks
+
+MainWD <- getwd()
+setwd_knit(MainWD)
+threads <- 100
+rerun <- T
+
+if(!exists("Models")){
+        # load("../IsoFracCompiler/MW_Models_v3.rda")
+        load("../IsoFracCompiler2_noSemitryptic/Experiments/MW_Models_v3.rda")
+
+}
+# h2o.init()
+try(h2o.shutdown(prompt = F))
+ScoreCutoff <- 0.9
+
+
+```
+
+
+
+##  Functions
+
+```{r Functions}
+checkClusterLengths <- function(x){
+  barplot(table(x$hdbscanTables[cl_2!=0,length(unique(Seq)),.(cl_2,EnsG)]$V1))
+}
+
+Isofrac_PeakFinder <- function(it,randomized= F,inputSmall=inputSmall,pathAdd="./",clusterType="cl_2"){
+  library(data.table)
+  library(ggplot2)
+  library(pracma)
+  library(parallel)
+  
+  cat("\r PeakFinder",it)
+  # ens <- "ENSG00000167193"# crk
+  ens <- ens_vector[it]
+  if(!randomized){
+    pathname <- paste(pathAdd,"PeakFinder",sep = "/")
+    try({
+      dir.create(pathname,showWarnings = F)
+      nam <- paste("PeakFinder_it",it,sep = "")
+      write(c(it,ens),paste(pathname,nam,sep = "/"))
+      
+    })
+  }else{
+    try({
+      pathname <- paste(pathAdd,"PeakFinder",sep = "/")
+      
+      dir.create(pathname,showWarnings = F)
+      nam <- paste("PeakFinder_it",it,sep = "")
+      write(c(it,ens),paste(pathname,nam,sep = "/"))
+      
+    })
+  }
+  
+  
+  # if(any(grepl(";",ens))){
+  #   return(NULL)
+  # }
+  PeaksEnsg <- list(Problem="Yes")
+  try({
+    it <<- it
+    
+    # ens = "ENSG00000120802"
+    if(randomized){
+      sel <- inputSmall$dt_gn$ens==ens
+      if(all(!sel)){return(NULL)}
+      
+      hdbscanTable <- inputSmall$hdbscanTables_random[EnsG==ens]
+      dt <- inputSmall$TMTSubset_final_singlenorm_zscore[hdbscanTable$id,]
+      sel2 <- rep(T,dim(dt)[1])
+      
+      # sel2 <- hdbscanTable$FDR_RF< 0.05
+      # sel2[is.na(sel2)] <- F
+      
+    }else{
+      sel <- inputSmall$dt_gn$ens==ens
+      sel[is.na(sel)] <- F
+      if(all(!sel)){return(NULL)}
+      dt <- inputSmall$TMTSubset_final_singlenorm_zscore[sel,]
+      hdbscanTable <- inputSmall$hdbscanTables[EnsG==ens,]
+
+      hdbscanTable <- hdbscanTable[match(inputSmall$InputTable$Sequence[sel],hdbscanTable$Seq)]# what is the purpose of this line?
+      # dt <- dt[match(inputSmall$InputTable$Sequence[sel],hdbscanTable$Seq)]# what is the purpose of this line?
+      
+      hdbscanTable$FDR_RF[is.na(hdbscanTable$FDR_RF)]<-1
+      sel2 <- hdbscanTable$FDR_RF<10 # switched off
+      sel2[is.na(sel2)] <- F 
+    }
+    
+    # plot(Gpplot_LineTraces(dt[sel2,],applyhdbclust = F))
+    if(all(!sel2)){return(NULL)}
+    
+    library(pracma)
+    
+    hdbscanTable2 <- hdbscanTable#[sel2,]# FDR Control, but not used anymore
+    dt2 <- dt#[sel2,]
+    if(clusterType=="cl_2"){
+      hdbscanTable2$cl_2[is.na(hdbscanTable2$cl_2)] <- -1
+      cls <- setdiff(unique(hdbscanTable2$cl_2),c(0,-1))
+      hdbscanTable2$UsedClusters <- hdbscanTable2$cl_2
+      
+    }else{
+      hdbscanTable2$cl_3[is.na(hdbscanTable2$cl_3)] <- -1
+      cls <- setdiff(unique(hdbscanTable2$cl_3),c(0,-1))
+      hdbscanTable2$UsedClusters <- hdbscanTable2$cl_3
+      
+    }
+    
+    if(length(cls)==0){
+      return(1)
+    }
+    # clusterExport(cl,c("dt2","hdbscanTable2"))
+    PeaksEnsglist <- lapply(sort(cls),function(clsi){
+      cat("\r",clsi)
+      clsi <<- clsi
+      temp <- dt2[hdbscanTable2$UsedClusters==clsi,]
+      
+      
+      TempMean2 <- sapply(1:20,function(x){
+        TempMean <- apply(temp[sample(1:dim(temp)[1],replace = T),],2,median,na.rm = T)
+        TempMean
+      })
+      TempMean <- t(TempMean2)
+      TempMeanSmooth <- apply(TempMean,2,median,na.rm = T)
+      
+      TempMeanSd <- apply(TempMean2,2,function(x){sd(x,na.rm=T)})
+      
+      # TempMean <- apply(temp,2,median,na.rm = T)
+      # TempMeanSmooth <- savgol(TempMean,11,forder= 4,dorder=0)
+      
+      fp <- data.table(findpeaks(TempMeanSmooth,nups = 1,ndowns = 1,threshold = 0.1))
+      if(dim(fp)[1]==0){
+        return(NULL)
+      }
+      # fp2 <- data.table(findpeaks(TempMean,nups = 1,ndowns = 1))
+      fp$smooth <- F
+      # fp2$smooth <- F
+      
+      colnames(fp) <- c("Height","Peak","Start","End","Smooth")
+      fp[,c("StartDiff","EndDiff","PeakSD"):={
+        gr <- .BY
+        f1 <- TempMeanSmooth[(.BY$Peak-1):.BY$Start]
+        f2 <- TempMeanSmooth[(.BY$Peak+1):.BY$End]
+        f1.1 <<- .BY$Height-mean(f1,na.rm = T)
+        f2.2 <<- .BY$Height-mean(f2,na.rm = T)
+        
+        list(f1.1,f2.2,mean(TempMeanSd[.BY$Start:.BY$End],na.rm=T))
+        
+      },.(Height,Peak,Start,End,Smooth)]
+      qcutof <-quantile(unlist(temp),c(0.05,0.1,0.15,0.2),na.rm = T)
+      fp$Q0p5CutOff <- qcutof[1]
+      fp$Q1CutOff <- qcutof[2]
+      fp$Q1p5CutOff <- qcutof[3]
+      fp$Q2CutOff <- qcutof[4]
+      
+      fp$Median <- median(unlist(temp),na.rm = T)
+      
+      
+      colorder <- colnames(fp)
+      # fp <- fp[,{
+      #   temp <- .SD
+      #   temp$mpw <- NULL
+      #   data.frame(unique(temp),mpw =max(mpw,na.rm = T))
+      #   
+      # },Peak]
+      setcolorder(fp,colorder)
+      if(length(fp)==0){return(NULL)}
+      col <- rainbow(dim(fp)[1],alpha = 0.5)
+      # sapply(1:dim(fp)[1],function(it){
+      #   x <- fp[it,]
+      #   polygon(c(x[3],x[4],x[4],x[3]),c(rep(-2,2),rep(2,2)),col = col[it],border = NA)
+      #   NULL
+      # })
+      if(length(fp)>0){
+        # plot(TempMeanSmooth,type ="l")
+        # apply(temp,1,function(x){
+        #   points(x,type="l")
+        # })
+        
+        col <- rainbow(dim(fp)[1],alpha = 0.2,v=0.8)
+        plotstuffSet <- F
+        if(plotstuffSet){
+          plot(TempMeanSmooth,type ="l")
+          apply(temp,1,function(x){
+            points(x,type="l")
+          })
+        }
+        
+        
+        Peaks <- sapply(1:dim(fp)[1],function(it,plotstuff=plotstuffSet){
+          it <<- it
+          PositionTable <- rep(NA,9)
+          ({
+            x <- unlist(fp[it,])
+            if(plotstuff){
+              polygon(c(x[3],x[4],x[4],x[3]),c(rep(-2,2),rep(2,2)),col = col[it],border = NA)
+              abline(v=x[2],lty = "dotted",col=purecol<- gsub("..$","",col[it]),lwd = 2)
+            }
+            
+            
+            # if(diff(c(x[2:3]))>1){
+            #   correct <- 1
+            # }else{
+            #   correct <- 0
+            # }
+            
+            
+            # LM from the left
+            
+            lm_1 <- lm_checker(x[3],x[2],temp)
+            lm_2 <- lm_checker(x[2],x[4],temp,cutatstart = F)
+            
+            CoefReal <- lmIntx(lm_1$md,lm_2$md)
+            # cl2 <- makeCluster(5)
+            
+            # clusterExport(cl2,c("temp","lm_checker","x","rbindlist","lmIntx"))
+            # print("BOOTSTRAP")
+            lm_bs <- sapply(1:20,function(it){
+              # cat("\r",it)
+              lm_1 <- lm_checker(x[3],x[2],temp,bootstrap = T)
+              lm_2 <- lm_checker(x[2],x[4],temp,bootstrap = T,cutatstart = F)
+              if(is.na(lm_1$md$coefficients[2])|is.na(lm_2$md$coefficients[2])){
+                CoefReal <- data.frame(x=NA,y=NA)
+              }else{ 
+                CoefReal <- lmIntx(lm_1$md,lm_2$md)
+              }
+              
+              unlist(CoefReal)
+            })
+            quantile_80 <- apply(lm_bs,1,quantile,probs=c(0.1,0.9),na.rm = T)
+            sd_80 <- apply(lm_bs,1,function(x){sd(x,na.rm=T)})
+            
+            PositionTable <- cbind(CoefReal,t(as.matrix(as.vector(quantile_80))),lm_1$n,t(as.matrix(as.vector(sd_80))))
+            names(PositionTable) <- c("Fraction_lm","Height_lm","Fraction_BS_lo","Fraction_BS_hi","Height_BS_lo","Height_BS_hi","n","Fraction_sd_80","Height_sd_80")
+            PositionTable$Fraction_width <- diff(c(PositionTable$Fraction_BS_lo,PositionTable$Fraction_BS_hi))
+            PositionTable$Height_width <- diff(c(PositionTable$Height_BS_lo,PositionTable$Height_BS_hi))
+            
+            
+          })
+          
+          # c(x,xout,yout,xout_all,yout_all,xsd=NA,ysd=NA,xsd_all=NA,ysd_all=NA,coefs)
+          
+          
+          cbind(t(as.matrix(x)),PositionTable)
+          
+        })
+        
+        print("DONE")
+        Peaks <- t(Peaks)
+        Peaks <- data.frame(Peaks)
+        
+      }else{return(NULL)}
+      Peaks$cluster2 <- clsi
+      Peaks
+    })
+    print("Combining")
+    PeaksEnsglist2 <<- PeaksEnsglist
+    print(lengths(PeaksEnsglist))
+    PeaksEnsg <- rbindlist(PeaksEnsglist)
+    PeaksEnsg$ENS <- ens
+  })
+  PeaksEnsg
+}
+
+lmIntx <- function(fit1, fit2, rnd=2) {
+  #Substitution method
+  #https://stackoverflow.com/questions/7114703/finding-where-two-linear-fits-intersect-in-r
+  b1<- fit1$coefficient[1]  #y-int for fit1
+  m1<- fit1$coefficient[2]  #slope for fit1
+  b2<- fit2$coefficient[1]  #y-int for fit2
+  m2<- fit2$coefficient[2]  #slope for fit2
+  df <- data.frame(x=NA, y=NA)
+  
+  if(m1==m2 & b1==b2) {print("Lines are identical")
+  } else if(m1==m2 & b1 != b2) {print("Lines are parallel")
+  } else {
+    x <- (b2-b1)/(m1-m2)      #solved general equation for x
+    y <- m1*x + b1            #plug in the result
+    df <- data.frame(x=round(x, rnd), y=round(y, rnd))
+  }
+  df
+}
+lm_checker <- function(start,end,df,bootstrap=F,rangeCutoff = 3,cutatstart=T,ggplotstuff=F){
+  # start = x[3]
+  # end = x[2]
+  # df = temp
+  # start <<- start
+  # end <<- end
+  # df <<- df
+  x1 <- start:end
+  if(cutatstart){
+    if(diff(range(x1))>rangeCutoff){
+      x1 <- (start+rangeCutoff-1):end
+    }
+  }else{
+    if(diff(range(x1))>rangeCutoff){
+      x1 <- (start):(end-rangeCutoff+1)
+    }
+  }
+  
+  
+  # x1 <- start:end
+  x1_all <- lapply(x1,function(itx){
+    data.frame(itx,data.frame(df)[,itx])
+  })
+  x_all <- lapply(1:dim(df)[2],function(itx){
+    data.frame(itx,data.frame(df)[,itx])
+  })
+  x_all <- rbindlist(x_all)
+  x1_all <- rbindlist(x1_all)
+  if(bootstrap){
+    s <- sample(1:dim(x1_all)[1],replace = T)
+    lm_md <- lm(as.numeric(unlist(x1_all[s,2]))~as.numeric(unlist(x1_all[s,1])))
+  }else{
+    lm_md <- lm(as.numeric(unlist(x1_all[,2]))~as.numeric(unlist(x1_all[,1])))
+  }
+  names(x_all) <- c("V1","V2")
+  names(x1_all) <- c("V1","V2")
+  
+  # plotting
+  g <- NA
+  try({
+    coef <- coefficients(lm_md)
+    g <- ggplot(x_all,aes(V1,V2))+geom_point()+geom_abline(slope=coef[2],intercept = coef[1])+geom_vline(xintercept = range(x1),lty= "dotted")
+    if(ggplotstuff){
+      print(g)
+    }
+  })
+  # 
+  
+  list(md=lm_md,x1_all=x1_all,g=g,n=dim(x1_all)[1])
+}
+ggtraces <- function(input,ens_identifier="ENSG00000120802"){
+  
+  
+  PeakResults_TMPO<- data.table(input$IsoFrac_PeakResultsTable)[ENS==ens_identifier]
+  
+  PeakResults_TMPO$id <- PeakResults_TMPO$cluster2
+  PeakResults_TMPO$cl <- PeakResults_TMPO$cluster2
+  
+  g2 <- Traces_GGplot(input)
+  g3 <- NULL
+  try({
+    g3 <- g2+geom_errorbar(data=PeakResults_TMPO,aes(x=10^unlist(MW_lm),y=unlist(Height_lm),ymin=unlist(Height_BS_lo),ymax=unlist(Height_BS_hi)),color="black")+
+      geom_errorbarh(data=PeakResults_TMPO,aes(x=10^unlist(MW_lm),y=unlist(Height_lm),xmin=10^unlist(MW_lm_lo),xmax=10^unlist(MW_lm_hi)),color="black")+xlab("log10 MW")+ylab("cluster zscore [au]")+
+      geom_label_repel(data=PeakResults_TMPO,aes(x=10^unlist(MW_lm),y=unlist(Height_lm),label=round(10^unlist(MW_lm))),size = 2)+
+      geom_point(data=PeakResults_TMPO,aes(10^unlist(MW_lm),unlist(Height_lm),label=round(10^unlist(MW_lm)),group=NULL,color=as.character(cluster2)),color="black")
+  })
+  
+  list(Traces=g2,TraceAndPoints=g3)
+}
+  NetworkTablesCompiler <- function(ensIT="ENSG00000120802",iprTable){
+    library(data.table)
+    cat("\r",ensIT)
+    ensIT <- ensIT
+    temp <- iprTable[ENS==ensIT]
+    
+    if(dim(temp)[1]>1){
+      co <- combn(1:dim(temp)[1],2)
+    }else{
+      co <- matrix(rep(1,2),ncol=1)
+    }
+    temp$FractionWidth = unlist(temp$End)-unlist(temp$Start)
+    
+    Mix <- apply(co,2,function(x){
+      x <<- x
+      a <- temp[x[1]]
+      b <- temp[x[2]]
+      li <- list(c(a$MW_lm,a$MW_lm_gel_hi,a$MW_lm_gel_lo,a$MW_lm_hi,a$MW_lm_lo),
+                 c(b$MW_lm,b$MW_lm_gel_hi,b$MW_lm_gel_lo,b$MW_lm_hi,b$MW_lm_lo))
+      # boxplot(li <- list(c(a$MW_lm,a$MW_lm_gel_hi,a$MW_lm_gel_lo,a$MW_lm_hi,a$MW_lm_lo),
+      #                    c(b$MW_lm,b$MW_lm_gel_hi,b$MW_lm_gel_lo,b$MW_lm_hi,b$MW_lm_lo))
+      # )
+      p <- as.double(NA)
+      p2 <- as.double(NA)
+      try({
+        p   <- wilcox.test(li[[1]],li[[2]])$p.value
+      },silent = T)
+      try({
+        p2  <- wilcox.test(li[[1]][c(1,4,5)],li[[2]][c(1,4,5)])$p.value
+        
+      },silent = T)
+      # requiredEntries <- c("MW_lm","p","p2","Cluster_FDR_RF","FDR_RF","FDR_DL","mpw","FractionWidth","cluster2")
+      # for(i in requiredEntries){
+      #   if(all(names(a)!=i)){
+      #     a <- cbind(a,NA)
+      #   }
+      # }
+      
+      t1 <- cbind(a$MW_lm,a$MW_lm,1,1 ,a$Cluster_FDR_RF,a$Cluster_FDR_RF,unlist(a$Height),a$FractionWidth,a$cluster2,length(li[[1]]),length(li[[1]]),a$id,a$id)
+      t2 <- cbind(b$MW_lm,b$MW_lm,1,1 ,b$Cluster_FDR_RF,b$Cluster_FDR_RF,unlist(b$Height),b$FractionWidth,b$cluster2,length(li[[2]]),length(li[[2]]),b$id,b$id)
+      t3 <- cbind(a$MW_lm,b$MW_lm,p,p2,a$Cluster_FDR_RF,b$Cluster_FDR_RF,min(unlist(c(a$Height,b$Height))),max(c(a$FractionWidth,b$FractionWidth)),paste(a$cluster2,b$cluster2,collapse=";"),length(li[[1]]),length(li[[2]]),a$id,b$id)
+      r <- rbind(t1,
+                 t2,
+                 t3)
+      
+      colnames(r) <- c("from", "to","p","p2","Cl_FDR1","Cl_FDR2","mpw","FractionWidth","Cluster","n1","n2","id1","id2")
+      as.data.table(r)
+    })
+    Mix <- rbindlist(Mix)
+    Mix <- unique(Mix)
+    # Mix$from <- round(10^Mix$from)
+    # Mix$to <- round(10^Mix$to)
+    
+    
+    # g <- graph_from_data_frame(d=Mix[p2>0.05&p>0.1&mpw>=0,])
+    # g <- as.undirected(g)
+    list(networkTable=Mix,ens=ensIT)
+  }
+nw_assembler <- function(input,EnsID,traces_info=NULL,cbPalette =c( "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"),
+                         nodeColors = list(isofrac="#E69F00",db="#CC79A7"),
+                         ProteinSequences=NULL,applyCutoffs=T
+                         
+){
+  ip <<- input$IdentifiedPeaks_Table
+  hdbscan <<- input$hdbscanTables[EnsG==EnsID,,]# hdbscan results
+  ipseub <<- ip[ENS==EnsID] # PeaksResults 
+  if(dim(ipseub)[1]==0){
+    return(NULL)
+  }
+  if(length(traces_info)>0&applyCutoffs){
+    ipseub[,Sel :={
+      gr <<- .BY
+      tr <- traces_info[gr$Height==Height&
+                          gr$cluster2==unlist(cluster2)&
+                          Peak==unlist(Peak),]
+      dim(tr)[1]>0
+      
+    },.(Height=unlist(Height),cluster2=unlist(cluster2),Peak=unlist(Peak))]
+    print(table(ipseub$Sel))
+    ipseub <- ipseub[Sel==TRUE,]
+  }
+  if(dim(ipseub)[1]==0){
+    return(NULL)
+  }
+  
+  CombiVec <- ipseub[,.(Seq={
+    hdbscan[cl_2==.BY$cluster2]$Seq
+  }),.(cluster2,Compressed_MW_Variants,MW_lm_Compressed_)]
+  
+  
+  
+  nodes <- data.frame(id = c(hdbscan$Seq,unique(CombiVec$Compressed_MW_Variants))                    )
+  cbp <- colorRampPalette(cbPalette)(max(CombiVec$cluster2))
+  nw_nodes1 <- CombiVec[,.(id=.BY$Seq,
+                           # shape="circle",
+                           value=0,
+                           label=.BY$Seq,
+                           color=cbp[unique(cluster2)],
+                           group="Seq",shape="dot"),Seq]
+  val <- as.numeric(as.factor(nw_nodes1$color))
+  # plot(1:length(cbPalette),pch=20,col=cbPalette)
+  # nw_nodes1$color <- colorRampPalette(cbPalette[-c(2,7)])(max(val))[val]
+  nw_nodes2 <- CombiVec[,.(id=.BY$Compressed_MW_Variants,
+                           shape="square",
+                           color=nodeColors$isofrac,
+                           value=round(10^round(.BY$MW_lm_Compressed_,2),-3),
+                           label=paste("IsoFrac",paste(round(10^round(.BY$MW_lm_Compressed_,2),-3),"Da"),sep = " # "),group="MQ",value=0),.(Compressed_MW_Variants,MW_lm_Compressed_)]
+  
+  if(length(ProteinSequences)>0){
+    EnsVec <- ProteinSequences[ENSG==ensVec]
+    if(dim(EnsVec)[1]==0){
+      return(NULL)
+    }
+    EnsVecFun <- lapply(hdbscan$Seq,function(x){
+      x <<- x
+      EnsVecFun <- EnsVec[grep(x,EnsVec$SEQUENCE,fixed = T),]
+      EnsVecFun$Seq <- x
+      unique(EnsVecFun)
+    })
+    EnsVecFun <- rbindlist(EnsVecFun)
+    EnsVecFun <- unique(EnsVecFun)
+    addedInfo <- "UniProt"
+    nw_nodes3 <- data.table(id=paste(addedInfo,round(EnsVecFun$MW,-3)),
+                            shape = "triangle",
+                            group=addedInfo,
+                            value=round(EnsVecFun$MW,-3),
+                            color=nodeColors$db,
+                            label=paste(EnsVecFun$ProteinID,paste(round(EnsVecFun$MW,-3),"Da"),sep = " # "))
+    nw_nodes3 <- unique(nw_nodes3)
+  }else{
+    nw_nodes3 <- NULL
+  }
+  
+  
+  nw_nodes <- rbind(nw_nodes1,nw_nodes2,nw_nodes3,fill=T)
+  
+  edges <- data.frame(from = CombiVec$Seq, to = CombiVec$Compressed_MW_Variants)
+  if(length(nw_nodes3)>0){
+    edges2 <- data.frame(from = EnsVecFun$Seq, to = paste(addedInfo,round(EnsVecFun$MW,-3)))
+    edges <- rbind(edges,edges2)
+  }
+  
+  # For Sequence Output
+  CombiVec$MW <- NA
+  CombiVec$Score <- NA
+  setcolorder(CombiVec,c("Seq","cluster2","MW","MW_lm_Compressed_","Score"))
+  AssembledTable <-   CombiVec
+  names(AssembledTable) <- c("Seq","Cl","MW","MW_obs","Score","Cl_variants")
+  
+  NW_list <- list(edges=edges,nodes=nw_nodes,AssembledTable=AssembledTable)
+}
+# NW_list <- nw_assembler(input = input,EnsID = ensVec,traces_info = traces_info,ProteinSequences = ProteinSequences)
+# stop()
+nw_plot <- function(nw_assembler_output,NetSet="Both",nodeColors = list(isofrac="#E69F00",db="#CC79A7"),type="VizPlot",addedInfo="UniProt"){
+  v=NULL
+  p=NULL
+  nw <- nw_assembler_output
+  if(type=="VizPlot"&require(visNetwork)){
+    if(NetSet=="Both"){
+      sel <- rep(T,dim(nw$nodes)[1])
+    }
+    if(NetSet=="Ensembl"){
+      sel <- grepl(paste(addedInfo,"|Seq"),nw$nodes$group)
+    }
+    if(NetSet=="IsoFrac"){
+      sel <- grepl("MQ|Seq",nw$nodes$group)
+      
+    }
+    
+    v <- visNetwork(edges = nw$edges,nodes=nw$nodes[sel,]) %>% visOptions(manipulation = TRUE)#visIgraphLayout()#visOptions(manipulation = TRUE)
+    v <- v%>%visGroups(groupname = "Uniprot", color = nodeColors$isofrac,shape="square") %>%
+      visGroups(groupname = "IsoFrac", color = nodeColors$db,shape="triangle") %>%visLegend() 
+  }
+  if(type=="igraph"&require(igraph)){
+    nw_edges <- nw$edges
+    convertIDtoName <- function(x,nw){
+      nw$nodes[match(x,id)]$label
+    }
+    
+    # nw_edges$label <- convertIDtoName(nw_edges$to,nw)
+    # nw_edges$label <- convertIDtoName(nw_edges$to,nw)
+    
+    
+    # nw_nodes$label <- convertIDtoName(nw_nodes$id,nw)
+    
+    # nw_edges$from <- convertIDtoName(nw_edges$from,nw)
+    
+    v <- graph_from_data_frame(nw_edges,directed = F)
+    co <- sapply(attributes(V(v))$names,function(x){
+      x <<- x
+      co <-  nw$nodes[id==x]$color
+      
+    })
+    sh <- sapply(attributes(V(v))$names,function(x){
+      x <<- x
+      co <-  nw$nodes[id==x]$shape
+      
+    })
+    co[lengths(co)==0] <- "grey"
+    sh[lengths(sh)==0] <- "circle"
+    sh <- unlist(sh)
+    sh[sh=="triangle"] <- "square"
+    sh[sh=="dot"] <- "circle"
+    
+    V(v)$color <- unlist(co)
+    V(v)$shape <- unlist(sh)
+    V(v)$size=5
+    V(v)$label.cex=0.4
+    V(v)$label.dist = 1
+    # graphics.off()
+    # Preparing Similarity Measures
+    Vertice <- V(v)
+    NodesOfInterest <- nw$nodes[shape!="dot",]
+    Label <- paste(NodesOfInterest$id)
+    sel <- which(!is.na(match(attributes(Vertice)$name,Label)))
+    v_simi<- igraph::similarity(v,V(v)[sel])
+    library(pheatmap)
+    
+    p <- NULL
+    try({
+      colnames(v_simi) <- nw$nodes[match(attributes(V(v)[sel])$names,id)]$label
+      rownames(v_simi) <- nw$nodes[match(attributes(V(v)[sel])$names,id)]$label
+      p <- pheatmap(v_simi,silent = T)
+    })
+    
+    # p
+    
+    # }
+    v_simi <<- v_simi
+    si_list <- NULL
+    try({
+      si_list <- lapply(2:dim(v_simi)[2],function(it){
+        it <<- it
+        si <- v_simi[1:(it-1),it]
+        co_ori <- rownames(v_simi)[1:(it-1)]
+        co2_ori <- colnames(v_simi)[it]
+        co <- (strsplit(co_ori," # "))
+        co2 <- (strsplit(co2_ori," # "))
+        
+        data.frame(I1=co_ori,                
+                   I2=co2_ori,
+                   T1=sapply(co,"[[",1),
+                   T2=sapply(co2,"[[",1),
+                   MW1=gsub(" Da","",sapply(co,"[[",2)),
+                   MW2=gsub(" Da","",sapply(co2,"[[",2)),
+                   similarity=si)
+        
+      })
+      si_list <- rbindlist(si_list)
+      si_list$Delta_MW <- as.numeric(si_list$MW1)-as.numeric(si_list$MW2)
+    })
+    
+    
+    list(v=v,p=p,type=type,simi_matrix=v_simi,simiList =si_list)
+  }
+}
+
+
+traces_info_crawler <- function(input,EnsID="ENSG00000120802",seqFDR=1,sd80=c(0,2),PeakScore=0.15){
+  PeakResults_TMPO <<- data.table(input$IsoFrac_PeakResultsTable)[ENS==EnsID]
+  PeakResults_TMPO$id <- PeakResults_TMPO$cluster2
+  PeakResults_TMPO$cl <- PeakResults_TMPO$cluster2 
+  ifw <- input$FractionWidth
+  # abs(Peak-Start)>=input$FractionWidth
+  PeakResults_TMPOfil <- PeakResults_TMPO                  
+  PeakResults_TMPOfil <- PeakResults_TMPOfil[unlist(Fraction_sd_80)>=sd80[1]&unlist(Fraction_sd_80)<=sd80[2]]
+  # print(dim(PeakResults_TMPO))
+  # print(dim(PeakResults_TMPOfil))
+  # unlist(Fraction_sd_80)<=input$SD80[1]&unlist(Fraction_sd_80)>=input$SD80[2]
+  # unlist(PeakResults_TMPO$Peak)-unlist(PeakResults_TMPO$End)
+  PeakResults_TMPOfil
+}
+
+```
+
+
+## PeakFinder
+-  Cluster FDR (Random Forest and DeepLearning)
+-   For each Gene:
+  -   calculating Average Profile
+  -   Findpeaks, keeping relevant quality measures
+  -   calculating lm cross section of left and right side of each peak. Using Bootstrapping to estimate variability
+  -   Forward and Reverse analysis
+<!-- Note: Timeconsuming anaylsis, about 4hours per gel -->
+-    PeakFDR analysis, using features from peak identifications
+  - included cluster 3 scans as well (2023/04/25)
+```{r PeakFinder}
+h2o.init()
+threads <- 100
+dir.create("Peakfinder7")
+setwd("./Peakfinder7/")
+```
+
+### PeakFinderRepair
+
+- rerunning after Ens_list.rda and combination of cl2 and cl3
+
+```{r PeakFinder}
+options(warn=-1)
+h2o.shutdown()
+h2o.init()
+TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(input){
+    setwd(MainWD)
+    print("Analysing")
+    print(input$xname)
+    input <- input
+    # stop()
+    xname <- gsub(".txt$","",make.names(input$xname))
+    xname <- paste("h2o_FDR_PeakFinder",xname,sep = "_")
+   
+    dir.create(xname)
+    setwd(xname)
+        print(getwd())
+
+    li1 <- input$hdbscanTables_random
+    li2 <- input$hdbscanTables
+   
+    il <- input$hdbscanTables
+    
+   
+    ens_vector <- unique(input$dt_gn$ens)
+    xname <- input$xname
+    rdapath <- paste(".",xname,"PeakFinder_Subset.rda",sep="/")
+    rdapath <- paste(".","PeakFinder_Subset.rda",sep="/")
+
+    file.exists(rdapath)
+    rerun <- T
+    if(!file.exists(rdapath)|rerun ){
+      PeakFinder <- try({
+        # This script is an excert for testing for ISOFRAC_Data_Compiler_V2.R
+        
+        graphics.off()
+        # pdf("ens_peak_fun.pdf")
+        library(parallel)
+        
+        
+        
+        # Script ----------------
+        hu <- load("ENS_List.rda")
+        Isopath <- "IsoFrac_PeakResults.rda"
+        if(!file.exists("Isopath")|rerun){
+          
+          hm <- rbindlist(ENS_List[lengths(ENS_List)>18])
+          hm <- as.data.frame(hm)
+          hm$PeakfinderSet <- "Cl_2"
+          
+          hm3 <- rbindlist(ENS_List_cl_3[lengths(ENS_List_cl_3)>18])
+          hm3 <- as.data.frame(hm3)
+          hm3$PeakfinderSet <- "Cl_3"
+          hm <- rbind(hm,hm3)
+          
+          hm_rev <- rbindlist(ENS_List_rev[lengths(ENS_List_rev)>18])
+          hm_rev$PeakfinderSet <- "Cl_2"
+          
+          hm_rev3 <- rbindlist(ENS_List_rev_cl_3[lengths(ENS_List_rev_cl_3)>18])
+          hm_rev3$PeakfinderSet <- "Cl_3"
+          
+          hm_rev <- rbind(hm_rev,hm_rev3)
+          
+          # training scores for FDR calcualtions
+          
+          hm$score <- 1
+          hm_rev$score <- 0
+          
+          hm_all <- rbind(hm,hm_rev)
+          hm_all$ENS <- NULL
+          hm_all$Height_SD <- NULL
+          hm_all$Height_SD_all <- NULL
+          hm_all$Fraction_SD <- NULL
+          hm_all$Fraction_SD_all <- NULL
+          hm_all$cluster2 <- NULL
+          colnames(hm_all)[dupl <- duplicated(colnames(hm_all))]
+          if(any(dupl)){
+            hm_all <-data.frame(hm_all)[,-dupl]
+            
+          }
+          # hm_all$Height <- NULL
+          hm_all <- as.data.table(hm_all)
+          
+          # hm_all$Peak <- NULL
+          # hm_all$Start <- NULL
+          # hm_all$End <- NULL
+          # hm_all$mpw <- NULL
+          hm_all_temp <- apply(hm_all,2,unlist)
+          hm_all_temp <- data.frame(hm_all_temp)
+          hm_all_temp$score <- as.numeric(hm_all_temp$score)
+          hmsub <- hm_all_temp[hm_all_temp$PeakfinderSet=="Cl_2",]
+          set.seed(1234)
+          hmsub$score <- jitter(hmsub$score,amount = 0.001)
+          h2odt <- as.h2o(hmsub)
+         
+          hm$FDR_RF <- -1#FDR
+          hm$FDR_DL <- -1#FDR_DL
+
+          IsoFrac_PeakResults <- hm
+          IsoFrac_PeakResults_random <- hm_rev
+          
+          IsoFrac_PeakResults <- hm
+          IsoFrac_PeakResults_random <- hm_rev
+          save(IsoFrac_PeakResults,IsoFrac_PeakResults_random,file=Isopath)
+        }else{
+          load(Isopath)
+        }
+        
+        
+        input$IsoFrac_PeakResultsTable <- IsoFrac_PeakResults
+        input$IsoFrac_PeakResultsTable_random <- IsoFrac_PeakResults_random
+        
+        # predicting Fractions:
+        # correting out of range predictions
+        input$IsoFrac_PeakResultsTable$Fraction_lm[input$IsoFrac_PeakResultsTable$Fraction_lm < -1] <- -1
+        input$IsoFrac_PeakResultsTable$Fraction_lm[input$IsoFrac_PeakResultsTable$Fraction_lm > 29] <- 29
+        
+        input$IsoFrac_PeakResultsTable$Fraction_BS_lo[input$IsoFrac_PeakResultsTable$Fraction_BS_lo < -3] <- -3
+        input$IsoFrac_PeakResultsTable$Fraction_BS_hi[input$IsoFrac_PeakResultsTable$Fraction_BS_hi > 31] <- 31
+        
+        input$IsoFrac_PeakResultsTable_random$Fraction_lm[input$IsoFrac_PeakResultsTable_random$Fraction_lm < -1] <- -1
+        input$IsoFrac_PeakResultsTable_random$Fraction_lm[input$IsoFrac_PeakResultsTable_random$Fraction_lm > 29] <- 29
+        
+        input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo[input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo < -3] <- -3
+        input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi[input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi > 31] <- 31
+        
+        if(!exists("Models")){
+          load("../IsoFracCompiler/MW_Models_v3.rda")
+          h2o.init(nthreads = 10)
+          
+        }
+        
+        
+        
+        
+        Models.i <- Models[[      which(input$xname==names(Models))]]
+        FractionShift = 0
+        
+        input$IsoFrac_PeakResultsTable$MW_lm <-    predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable$Fraction_lm))
+        input$IsoFrac_PeakResultsTable$MW_lm_hi <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_hi))
+        input$IsoFrac_PeakResultsTable$MW_lm_lo <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_lo))
+        
+        input$IsoFrac_PeakResultsTable$MW_lm_gel_hi <- predict(Models.i$MW_Predictor_addon$hi,unlist(input$IsoFrac_PeakResultsTable$Fraction_lm)+FractionShift)
+        input$IsoFrac_PeakResultsTable$MW_lm_gel_lo <- predict(Models.i$MW_Predictor_addon$lo,unlist(input$IsoFrac_PeakResultsTable$Fraction_lm)+FractionShift)
+        
+        input$IsoFrac_PeakResultsTable$MW_fr <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable$Fraction_lm)+FractionShift)
+        input$IsoFrac_PeakResultsTable$MW_fr_hi <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_hi)+FractionShift)
+        input$IsoFrac_PeakResultsTable$MW_fr_lo <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_lo)+FractionShift)
+        
+        input$IsoFrac_PeakResultsTable$MW_fr_gel_hi <- predict(Models.i$MW_Predictor_addon$hi,unlist(input$IsoFrac_PeakResultsTable$Fraction_lm)+FractionShift)
+        input$IsoFrac_PeakResultsTable$MW_fr_gel_lo <- predict(Models.i$MW_Predictor_addon$lo,unlist(input$IsoFrac_PeakResultsTable$Fraction_lm)+FractionShift)
+        
+        # Random Peaks
+        
+        input$IsoFrac_PeakResultsTable_random$MW_lm <-    predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm))
+        input$IsoFrac_PeakResultsTable_random$MW_lm_hi <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi))
+        input$IsoFrac_PeakResultsTable_random$MW_lm_lo <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo))
+        
+        input$IsoFrac_PeakResultsTable_random$MW_lm_gel_hi <- predict(Models.i$MW_Predictor_addon$hi,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm)+FractionShift)
+        input$IsoFrac_PeakResultsTable_random$MW_lm_gel_lo <- predict(Models.i$MW_Predictor_addon$lo,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm)+FractionShift)
+        
+        input$IsoFrac_PeakResultsTable_random$MW_fr <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm)+FractionShift)
+        input$IsoFrac_PeakResultsTable_random$MW_fr_hi <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi)+FractionShift)
+        input$IsoFrac_PeakResultsTable_random$MW_fr_lo <- predict(Models.i$MW_Predictor,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo)+FractionShift)
+        
+        input$IsoFrac_PeakResultsTable_random$MW_fr_gel_hi <- predict(Models.i$MW_Predictor_addon$hi,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm)+FractionShift)
+        input$IsoFrac_PeakResultsTable_random$MW_fr_gel_lo <- predict(Models.i$MW_Predictor_addon$lo,unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm)+FractionShift)
+        
+        length(input$IsoFrac_PeakResultsTable$ENS)
+        length(input$IsoFrac_PeakResultsTable_random$ENS)
+        setdiff(      names(input$IsoFrac_PeakResultsTable_random)
+                      ,      names(input$IsoFrac_PeakResultsTable))
+        
+        cl <- makeCluster(2,outfile="")
+        # stopCluster(cl)
+        print("Started Compilation of PeakIdentityList.")
+        ipr_PeakIdentityList <- parLapply(cl,list(input$IsoFrac_PeakResultsTable,
+        # ipr_PeakIdentityList <- lapply(list(input$IsoFrac_PeakResultsTable,
+                                            input$IsoFrac_PeakResultsTable_random),function(ipr){
+                                              ipr <<- ipr                              
+                                              
+                                              library(data.table)
+                                              ipr <- as.data.table(ipr)
+                                              library(igraph)
+                                              ipr <- data.table(ipr)
+                                              ipr_PeakIdentity <- ipr[,{
+                                                cat("\r",.BY$ENS)
+                                                temp <- .SD
+                                                temp$id <- 1:dim(temp)[1]
+                                                temp[,{
+                                                  temp2 <- .SD
+                                                },id]
+                                                Lapi <- lapply(1:dim(temp)[1],function(it){
+                                                  i <- temp[it,]
+                                                  check <- temp[-it,]
+                                                  lifu <- c(unlist(check$Fraction_lm)-unlist(i$Fraction_lm))
+                                                  
+                                                  #filtering
+                                                  tempMix <- check[abs(lifu) <1,]
+                                                  if(dim(tempMix)[1]>0){
+                                                    re <- cbind((unlist(i$Fraction_lm)),(unlist(tempMix$Fraction_lm)),max(abs(lifu)[abs(lifu)<10],na.rm=T),
+                                                                unlist(i$Height),
+                                                                unlist(i$Peak),
+                                                                unlist(i$Start),
+                                                                unlist(i$End),
+                                                                unlist(i$Fraction_lm),
+                                                                unlist(i$Height_lm),
+                                                                unlist(i$Fraction_BS_hi),
+                                                                unlist(i$Fraction_BS_lo),
+                                                                unlist(i$cluster2),
+                                                                unlist(i$Fraction_sd_80)
+                                                    )
+                                                    # additional filtering possible here:
+                                                    re <- data.frame(re)
+                                                    # re <- tempMix
+                                                  }else{
+                                                    re <- cbind(i$Fraction_lm,i$Fraction_lm,0,unlist(i$Height),
+                                                                unlist(i$Peak),
+                                                                unlist(i$Start),
+                                                                unlist(i$End),
+                                                                unlist(i$Fraction_lm),
+                                                                unlist(i$Height_lm),
+                                                                unlist(i$Fraction_BS_hi),
+                                                                unlist(i$Fraction_BS_lo),
+                                                                unlist(i$cluster2),
+                                                                unlist(i$Fraction_sd_80))
+                                                  }
+                                                  re
+                                                })
+                                                Netfun <- rbindlist(Lapi)
+                                                # Netfun <- unique(Netfun)
+                                                g <- graph_from_data_frame(d=Netfun)
+                                                g$Edges$Width
+                                                g <- as.undirected(g)
+                                                # plot(g)
+                                                MaxCliques <- maximal.cliques(g)
+                                                le <- lapply(1:length(MaxCliques),function(x){data.table(as.numeric(attributes(MaxCliques[[x]])$names),x)})
+                                                le <- rbindlist(le)
+                                                colnames(le) <- c("Fraction","PeakIdentity")
+                                                Mapping <- le[,paste(PeakIdentity,collapse="_"),Fraction]
+                                                temp$Compressed_MW_Variants <- Mapping$V1[match(temp$Fraction_lm,Mapping$Fraction)]
+                                                temp
+                                                
+                                              },ENS]
+                                              
+                                              ipr_PeakIdentity[,c("MW_lm_Compressed_","MW_lm_Compressed_sd"):={
+                                                temp <- .SD
+                                                list(as.double(mean(unlist(temp$MW_lm),na.rm = T)),as.double(sd(unlist(temp$MW_lm),na.rm = T)))
+                                              },.(ENS,Compressed_MW_Variants)]
+                                              
+                                              ipr_PeakIdentity
+                                              
+                                            })
+        stopCluster(cl)
+        input$IdentifiedPeaks_Table <- ipr_PeakIdentityList[[1]]
+        input$IdentifiedPeaks_Table_random <- ipr_PeakIdentityList[[2]]
+        print("Finished Compilation of PeakIdentityList.")
+        
+        save(input,file=rdapath)
+        
+        
+        
+      })
+      
+    }else{
+      PeakFinder <- try({load(rdapath)})
+      
+    }
+    print(paste("Loaded PeakfinderData from",file.info(rdapath)$mtime))
+    
+    if(class(PeakFinder)=="try-error"){
+      # stop()
+      print("!!! WARNING !!!")
+      print("Problems in PeakFinder")
+      print(input$xname)
+    }
+    input
+  })
+
+
+options(warn=1)
+TableListNormEnsHdbScanMW_Peaks[[1]]$Id
+# setwd_knit(MainWD)
+setwd(MainWD)
+lapply(TableListNormEnsHdbScanMW_Peaks,function(x){dim(x$IdentifiedPeaks_Table)})
+# table(TableListNormEnsHdbScanMW_Peaks[[1]]$IdentifiedPeaks_Table$)
+table(TableListNormEnsHdbScanMW_Peaks[[2]]$IdentifiedPeaks_Table$PeakfinderSet)
+table(TableListNormEnsHdbScanMW_Peaks[[3]]$IdentifiedPeaks_Table$PeakfinderSet)
+
+save(TableListNormEnsHdbScanMW_Peaks,file="TableListNormEnsHdbScanMW_Peaks7.rda")
+# checkClusterLengths(TableListNormEnsHdbScanMW_Peaks[[4]])
+# }else{
+#   if(!exists("TableListNormEnsHdbScanMW_Peaks")){
+#       lo <- load("TableListNormEnsHdbScanMW_Peaks6.rda")
+#   }
+# print(paste("loaded TableListNormEnsHdbScanMW_Peaks6.rda from ",file.info("TableListNormEnsHdbScanMW_Peaks6.rda")$mtime))
+# }
+ipr <- TableListNormEnsHdbScanMW_Peaks[[2]]$IsoFrac_PeakResultsTable
+ipr <- data.table(ipr)
+ipr[grep("109320",ENS),]
+
+TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){
+  x$hdbscanTables[,PeptidesPerCluster:=length(unique(Seq)),.(EnsG,cl_2)]
+  x
+})
+TableListNormEnsHdbScanMW_Peaks[[1]]$hdbscanTables[PeptidesPerCluster==1&cl_2!=0&EnsG=="ENSG00000177548"]
+```
+## Renaming of gels
+
+```{r Renaming}
+##########################
+# Filtering for relevant gels:
+gels <- c("txt_2021_01_30_TMTpro_5er_MBR/peptides.txt",
+          "txt_2020_12_23_TMTpro_8per_MBR/peptides.txt",
+          "txt_2020_12_23_TMTpro_10per_MBR/peptides.txt")
+
+gelNames <- c("Exp1_5per_Try",
+              "Exp1_8per_Try",
+              "Exp1_10per_Try"
+              )
+
+s <- sapply(TableListNormEnsHdbScanMW_Peaks,function(x){x$xname})
+
+if(all(!is.na(match(s,gels)))){
+  TableListNormEnsHdbScanMW_Peaks <- lapply(1:length(gels),function(it){
+  print(it)
+  sel <- which(s==gels[[it]])
+  # stop()
+  input <- TableListNormEnsHdbScanMW_Peaks[[sel]]
+  input$xname_original <- input$xname
+  input$xname <- gelNames[it]
+  input
+})
+
+}else{
+  print("No Renaming possible. Either names were not set correct or data was already correctly renamed")
+}
+print(s)
+```
+
+
+## Compiling IdentifiedPeaks_Tables 
+-   Compiling PeakTables
+  -   Used in Isofrac Viewer Tool
+  -   generates PDF with rough view on Isoforms across different gels, 1 page per gene
+
+```{r Compilation of IdentifiedPeaks_Tables and Network}
+
+table(TableListNormEnsHdbScanMW_Peaks[[1]]$InputTable$SearchSpecificity)
+IP <- TableListNormEnsHdbScanMW_Peaks[[2]]$IdentifiedPeaks_Table
+l <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){x
+  
+  x <<- x
+  xp <- x$IdentifiedPeaks_Table
+  xp$gel <- x$xname
+  xp
+})
+la <- rbindlist(l)
+fwrite(la,"Isofrac_V3_IdentifiedPeaksTable_Combined.txt",sep = "\t")
+l <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){x$xname})
+
+rm("TableListNormEnsHdbScanMW_Peaks2")
+# gc()
+IsoformCountS <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){
+  x<<- x
+  print(x$xname)
+  IP <- x$IdentifiedPeaks_Table
+  IP <- IP[FDR_RF<0.01,,]
+  # IP <- IP[unlist(mpw)>0.2,,]
+  IP <- IP[unlist(Fraction_width)<3,]
+  IP <- IP[grep(";",ENS,invert = T),{length(unique(MW_lm_Compressed_))},ENS]
+  IP$Experiment <- x$xname
+  IP
+  
+})
+
+
+
+
+IsoformCountTable <- rbindlist(IsoformCountS)
+E <- dcast(IsoformCountTable,ENS~Experiment,value.var = "V1")
+E <- as.data.frame(E)
+ENS <- E$ENS
+E$ENS <- NULL
+E[is.na(E)] <- 0
+E <- apply(E,2,as.numeric)
+library(gplots)
+E[E>5] <- 6
+my_colors <- colorRampPalette(c("grey", "turquoise4","red"))  
+colnames(E) <- gsub("/peptides.txt","",colnames(E))
+colnames(E) <- gsub("/peptides_TryChymCOMBINED.txt","_ChyTry",colnames(E))
+
+dt_gn <- rbindlist(lapply(TableListNormEnsHdbScanMW_Peaks,function(x){x$dt_gn}))
+dt_gn <- unique(dt_gn)
+
+UniMapi <- dt_gn[,{
+  gn[1]
+  
+},ens]
+
+IsoformCount <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){
+  x<<- x
+  IP <- x$IdentifiedPeaks_Table
+  # IP <- x$IdentifiedPeaks_Table
+  IP <- IP[FDR_RF<0.01,,]
+  # IP <- IP[unlist(mpw)>=0.7,,]
+  IP <- IP[unlist(Fraction_width)<2,]
+  IP <- IP[grep(";",ENS,invert = T),{list(MWlog10=(unique(MW_lm_Compressed_)),
+                                          mpw=-10,
+                                          maxFracWidth = max(unlist(Fraction_width),na.rm = T),
+                                          MW_lm_lo = median(MW_lm_lo),
+                                          MW_lm_hi=median(MW_lm_lo))},ENS]
+  IP$Experiment <- x$xname
+  IP
+})
+
+IsoformCountTable <- rbindlist(IsoformCount)
+table(IsoformCountTable$Experiment)
+IsoformCountTable$Experiment <-  gsub("/peptides.txt","",IsoformCountTable$Experiment)
+IsoformCountTable$Experiment <-  gsub("/peptides.txt","",IsoformCountTable$Experiment)
+IsoformCountTable$Experiment<- gsub("2020_12_23_TMTpro_","gel1_",IsoformCountTable$Experiment)
+table(IsoformCountTable$Experiment)
+IsoformCountTable$Experiment<- gsub("2021_10_09_TM.*.pro_","gel2_",IsoformCountTable$Experiment)
+table(IsoformCountTable$Experiment)
+
+library(igraph)
+if(!file.exists("Isofrac_MW_graphs.pdf")|rerun){
+  pdf("Isofrac_MW_graphs.pdf")
+for(i in unique(IsoformCountTable$ENS)){
+  cat("\r",i)
+  cat("\r",i)
+  gn <- UniMapi$V1[UniMapi$ens==i]
+  # IsoformCountTable <- rbindlist(IsoformCount)
+  # Temp <- IsoformCountTable[ENS==i]
+  # Temp$ENS <- NULL
+  # Temp$V1 <- round(Temp$V1,1)
+  
+  
+  
+  Temp <- IsoformCountTable[ENS==i]
+  Temp$ENS <- NULL
+  Temp$MW <- apply(Temp,1,function(x){
+    x <<- x
+    sel <- Temp$MWlog10[(Temp$MWlog10>=as.numeric(x[names(x)=="MW_lm_lo"])&
+                           Temp$MWlog10<=as.numeric(x[names(x)=="MW_lm_hi"]))]
+    sel <- c(as.numeric(x[1]),sel)
+    # if(length(sel)>1){
+    #   co <-combn(sel,2)
+    #   
+    # }else{co <- NULL}
+    median(sel)
+  })
+  Temp$MW <- round(10^round(Temp$MW,2),-3)
+  
+  g <- graph_from_data_frame(as.data.frame(Temp)[,c("MW","Experiment")])
+  
+  vertices <- V(g)
+  shape <- sapply(names(vertices),function(x){
+    x <<- x
+    xu <- lapply(c("10per","8per","5per"),grep,x)
+    fu <- which(xu>0)
+    if(length(fu)==0){
+      fu <- 0
+    }
+    fu
+  })
+  # shape <- rep(0,length(vertices))
+  # shape[grep("^202[01]_.*.TMT",names(vertices))] <- 1:length(grep("^202[01]_.*.TMT",names(vertices)))
+  col <- shape
+  col[col==0] <- "grey"
+  V(g)$color <- col
+  V(g)$border <- "transparent"
+  V(g)$shape <- c("circle","square")[(shape!=0)+1]
+  wi <- as.numeric(names(V(g)))
+  wi[is.na(wi)] <- 100000
+  V(g)$size <- wi/max(wi)*30
+  V(g)$bg <- "transparent"
+  plot(g,main=paste(i,paste(substr(gn,1,20),"..."),sep = "\n"),vertex.frame.color="transparent")
+  
+}
+dev.off()
+system("open ./Isofrac_MW_graphs.pdf")
+}
+
+
+
+```
+## Compilation of Network Tables
+-   Full assembly of network tables, going through each gel and gene combining:
+  -   Isofrac and Database Proteins/Isoforms linked by same sequences identified in each gel
+  -   cluster 2 FDR
+```{r NetworkTables}
+
+save(TableListNormEnsHdbScanMW_Peaks,file="TableListNormEnsHdbScanMW_Peaks_NW.rda")
+
+```
+
+
+```{r Gene Examples,fig.show='hold'}
+geneList <- list(ENSG00000026025="VIM",ENSG00000076201="PTPN23",ENSG00000120802="TMPO",ENSG00000109320="nfkb1",ENSG00000167193="crk",ENSG00000172216="cebpb")
+# pdf("test.pdf")
+for(it in 1:length(geneList)){
+        gn <- geneList[[it]]
+        ensVec <- names(geneList)[it]
+  for(itg in 1:length(TableListNormEnsHdbScanMW_Peaks)){
+      
+      input <- TableListNormEnsHdbScanMW_Peaks[[itg]]
+      
+      traces_info <- traces_info_crawler(input,ensVec)
+      nwa <- nw_assembler(input,ensVec,traces_info = traces_info,ProteinSequences = ProteinSequences )
+      if(length(nwa)>0){
+          nwp <- nw_plot(nwa,type = "igraph")
+          plot(nwp$v,main=gn)
+      }
+
+  }
+
+}
+print("Done")
+# dev.off()
+# system("open test.pdf")
+
+
+```
+
+### Network assembly across gels
+ - Obsolete: May not RUN!!!
+```{r}
+if(0){
+  
+
+  IsoFrac_PeakResultsTable <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){
+    x$IsoFrac_PeakResultsTable$gel <- x$xname
+    x$IsoFrac_PeakResultsTable
+  })
+  ipr <- rbindlist(IsoFrac_PeakResultsTable)
+  if(!file.exists(
+    "NetworkTableCrossGels.rda"
+  )|rerun){
+    # TableListNormEnsHdbScanMW_Peaks <- TableListNormEnsHdbScanMW_PeaksSlim
+  GelNames <- sapply(TableListNormEnsHdbScanMW_Peaks,function(x){x$xname})
+  ENS <- unique(unlist(lapply(TableListNormEnsHdbScanMW_Peaks,function(x){x$dt_gn$ens})))
+  library(parallel)
+  # Define Fractions to be excluded
+  Gel_Fractions <- data.table(gel="5per|5er",IncludedFractionStart=5,IncludedFractionEnd=28)
+  
+  Gel_Fractions[,c("MWstart","MWend","gel_id"):={
+    g <<- grep(.BY$gel,GelNames)
+    input <<- Models[[g]]
+    p <- predict(input$MW_Predictor,c(.SD$IncludedFractionStart,.SD$IncludedFractionEnd))
+    p <- c(p,g)
+    as.list(p)
+  },gel]
+  
+  cl <- makeCluster(threads,output=NULL)
+  clusterExport(cl,list("ipr","GelNames","Gel_Fractions"))
+  NetworkTableCrossGels <- parLapply(cl,ENS,function(ensIT){
+    # NetworkTableCrossGels <- lapply(ENS,function(ensIT){
+    
+    library(data.table)
+    cat("\r",ensIT)
+    ensIT <<- ensIT
+    tempb <<- ipr[ENS==ensIT]
+    if(dim(tempb)[1]==0){
+      return(NULL)
+    }
+    tempb$IncludeFraction <- T
+    for(i in Gel_Fractions$gel){
+      tempb[grep(i,gel),IncludeFraction:={
+        te <<- .SD
+        g <- Gel_Fractions[gel==i]
+        te$Peak>=g$IncludedFractionStart&
+          te$End<=g$IncludedFractionEnd
+        
+      }]
+      
+    }
+    temp <- tempb[IncludeFraction==T]
+    if(dim(temp)[1]==0){
+      return(NULL)
+    }
+    # if(dim(tempb)[1]!=dim(temp)[1]){stop()}
+    temp[,{
+      
+      .BY$gel
+    },gel]
+    
+    if(dim(temp)[1]>1){
+      co <- combn(1:dim(temp)[1],2)
+    }else{
+      co <- matrix(rep(1,2),ncol=1)
+    }
+    temp$FractionWidth = unlist(temp$End)-unlist(temp$Start)
+    
+    Mix <- apply(co,2,function(x){
+      x <<- x
+      a <- temp[x[1]]
+      b <- temp[x[2]]
+      li <- list(c(a$MW_lm,a$MW_lm_gel_hi,a$MW_lm_gel_lo,a$MW_lm_hi,a$MW_lm_lo),
+                 c(b$MW_lm,b$MW_lm_gel_hi,b$MW_lm_gel_lo,b$MW_lm_hi,b$MW_lm_lo))
+
+      p <- as.double(NA)
+      p2 <- as.double(NA)
+      try({
+        p   <- wilcox.test(li[[1]],li[[2]])$p.value
+      },silent = T)
+      try({
+        p2  <- wilcox.test(li[[1]][c(1,4,5)],li[[2]][c(1,4,5)])$p.value
+        
+      },silent = T)
+      
+      t1 <- cbind(a$MW_lm,a$MW_lm,1,1,a$FDR_RF,a$FDR_RF,unlist(a$Height),
+                  a$FractionWidth,a$cluster2,which(GelNames==a$gel),length(li[[1]]),length(li[[1]]))
+      t2 <- cbind(b$MW_lm,b$MW_lm,1,1,b$FDR_RF,b$FDR_RF,unlist(b$Height),
+                  b$FractionWidth,b$cluster2,which(GelNames==b$gel),length(li[[2]]),length(li[[2]]))
+      
+      t3 <- cbind(a$MW_lm,b$MW_lm,p,p2,a$FDR_RF,b$FDR_RF,min(unlist(c(a$Height,b$Height))),max(c(a$FractionWidth,b$FractionWidth)),paste(a$cluster2,b$cluster2,collapse=";"),0,length(li[[1]]),length(li[[2]]))
+      r <- rbind(t1,
+                 t2,
+                 t3)
+      try(    colnames(r) <- c("from", "to","p","p2","mpw","FDR_RF_1","FDR_RF_2","FractionWidth","Cluster","Gel","n1","n2"))
+      try(    colnames(r) <- c("from", "to","p","p2","mpw","FDR_RF_1","FDR_RF_2","FractionWidth","Cluster","Gel","n1","n2"))
+      
+      as.data.table(r)
+    })
+    Mix <- rbindlist(Mix)
+    Mix <- unique(Mix)
+   
+    list(networkTable=Mix,ens=ensIT)
+  })
+  names(NetworkTableCrossGels) <- ENS
+  stopCluster(cl)
+  save(NetworkTableCrossGels,file="./NetworkTableCrossGels.rda")
+  gc()
+  
+  
+  
+  
+  # evaluating Peak Quality:
+  
+  graphics.off()
+  }else{
+    load("NetworkTableCrossGels.rda")
+  }
+  print(paste("Found NetworkTableCrossGels from ",file.info("NetworkTableCrossGels.rda")$mtime))
+}
+
+```
+
+## Peak Quality Model (Experimental)
+-  generating random distributions for good and bad peaks
+-  using RandomForest Model to predict shape quality of isoform peaks in the raw data
+```{r Peak Quality Model}
+# pdf("GaussianPeak.pdf")
+TrainingData <- c()
+allowed_Fraction_Width=seq(1,6,by=0.05)
+scalefunction <- function(x,type="median"){
+  if(type=="scale"){
+    x <- scale(x)
+  }
+  if(type=="max"){
+    x <-  x-min(x,na.rm = T)
+    x  <-  x/max(x,na.rm = T)
+    
+  }
+  if(type=="median"){
+    x <-  x-min(x,na.rm = T)
+    x  <-  x/median(x,na.rm = T)
+    
+  }
+  
+  x
+}
+typeset <- "max"
+for(jitterFac in seq(0,0)){
+  plot(1,type="n",xlim=c(-10,10),ylim=c(-2,2))
+  for(u in 1){
+    for(i in allowed_Fraction_Width){
+      # cat("\r",jitterFac,i,u)
+      sd=i
+      xvec <- seq(-10,10,1)
+      
+      mu <- 0
+      yvec <- sapply(xvec,function(x){
+        1/sd*(2*3.14)^0.5*exp(1)^(-0.5*((x-mu)^2/(2*sd)^2))
+      })
+     
+      cu <- list(x=xvec,y=yvec)
+      
+      cu$y <- jitter(cu$y,amount = jitterFac)
+      cu$y <- scalefunction(cu$y,type=typeset)
+      points(cu$x,cu$y,type="l",col="#99999940")
+      xvec <- c(-8,-4,-2,0,2,4,8)
+      
+      yvec <- sapply(xvec,function(x){
+        cu$y[abs(cu$x-x)==min(abs(cu$x-x))]
+      })
+      yvec <- scalefunction(yvec,type=typeset)
+      
+      yvecrandom <- jitter(rep(0.5
+                               ,7),amount = 0.1)
+      yvecrandom <- scalefunction(yvecrandom,type=typeset)
+      # TrainingData()
+      points(xvec,yvec,col = 2,type="l")
+      TrainingData <- rbind(TrainingData,c(yvec,i,jitterFac,1))
+      TrainingData <- rbind(TrainingData,c(-yvec+1,i,jitterFac,-1))
+      points(xvec,-yvec+1,col = 3,type="l")
+      
+      TrainingData <- rbind(TrainingData,c(yvecrandom,-10,jitterFac,0))
+      points(xvec,yvecrandom,col = 4,type="l")
+      
+    }
+    
+  }
+  
+}
+
+
+```
+
+
+### Applying  PeakQuality model: 
+-   Extracting features for each peak 
+-   Score prediction based on PQ model
+```{r Applying PeakQuality,fig.show='hold',out.width="50%",fig.cap="Peak Score distributions using Random Forest or DeepLearning Model"}
+if(!file.exists("TableListNormEnsHdbScanMW_Peaks_NW_PR.rda")|rerun){
+ colnames(TrainingData) <- c(rep("V",7),"i","jitter","Group")
+TrainingData <- as.data.frame(TrainingData)
+colnames(TrainingData) <- make.unique(colnames(TrainingData))
+h2o.init()
+train <- TrainingData[,1:7]
+train$Score <- TrainingData$Group
+plot(density(train$Score,bw=0.01))
+
+trainh2o <- as.h2o(train)
+md_rf <- h2o.randomForest(training_frame=trainh2o,y = "Score",nfolds = 20)
+md_ml <- h2o.deeplearning(training_frame=trainh2o,y = "Score",nfolds = 20)
+
+h2o::h2o.varimp_heatmap(list(md_ml,md_rf))
+
+lapply(TableListNormEnsHdbScanMW_Peaks,function(x){dim(x$IsoFrac_PeakResultsTable)})
+lapply(TableListNormEnsHdbScanMW_Peaks,function(x){dim(x$IsoFrac_PeakResultsTable)})
+
+
+TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_Peaks,function(input){
+  print(input$xname)
+  Iso_PRT <- input$IsoFrac_PeakResultsTable
+  # Iso_PRT[grep("109320",ENS)]
+  Iso_PRT <-data.table(Iso_PRT)
+  hdbst <-   input$hdbscanTables
+  Iso_PRT[,UsedClusters:={
+    # cat("\r",.GRP)
+    gr_0 <- .BY
+    temp_0 <- .SD
+    # stop("hue")
+    if(gr_0$PeakfinderSet=="Cl_2"){
+      temp_0$UsedClusters <- temp_0$cluster2
+      hdbst$UsedClusters <- hdbst$cl_2
+    }else{
+      temp_0$UsedClusters <- temp_0$cluster2
+      hdbst$UsedClusters <- hdbst$cl_3
+
+    }
+    temp_0$UsedClusters
+  },.(ENS,PeakfinderSet)]
+    
+    Iso_PRT_Table <- Iso_PRT[,{
+      
+    gr_0 <- .BY
+    temp_0 <- .SD
+    
+    r <- temp_0[,{
+      {
+    temp <- .SD
+    gr <- .BY
+    Zsc <- input$TMTSubset_final_singlenorm_zscore[hdbst[EnsG==gr_0$ENS]$id]
+    Zsc <- data.frame(Zsc)
+    RESULTS <- lapply(temp$Peak,function(peak){
+      peak <- peak
+      Selfun <-c( ((peak-3):peak),(peak:(peak+3))[-1])
+      Selfun[is.na(match(Selfun,1:28))] <- NA
+      tempPeak <- as.matrix(Zsc)[,Selfun]
+      if(!is.matrix(tempPeak)){
+        tempPeak <- as.matrix(tempPeak)
+        tempPeak <- t(tempPeak)
+      }
+      tempPeak <- apply(tempPeak,1,function(x){
+     
+        scalefunction(x,type = typeset)
+      })
+      tempPeak <- t(tempPeak)
+      colnames(tempPeak) <- c("V"    , "V.1"  , "V.2" ,  "V.3"  , "V.4"  , "V.5" ,  "V.6")
+      
+      rs <- rowSums(tempPeak+1,na.rm = T)
+      if(all(is.na(tempPeak))){
+        tempPeak <- tempPeak[1,]
+      }else{
+        tempPeak <- tempPeak[rs!=0,]
+      }
+      if(!is.matrix(tempPeak)){
+        tempPeak <- as.matrix(tempPeak)
+      }
+      if(dim(tempPeak)[2]==1){
+        tempPeak <- t(tempPeak)
+      }
+      tempPeak <- data.frame(tempPeak)
+      
+      tempPeak$Peak <- peak
+      tempPeak
+    
+    })
+    r <- rbindlist(RESULTS)
+    }
+
+    },.(UsedClusters)]
+    r
+  },.(ENS,PeakfinderSet)]
+
+
+  # creating h2o table 
+  predi <- as.h2o(Iso_PRT_Table)
+  # predicting Table
+  rf_predi <- predict(md_rf,predi)
+  dl_predi <- predict(md_ml,predi)
+  rf_predi <- as.data.frame(rf_predi)
+  dl_predi <- as.data.frame(dl_predi)
+  hist(rf_predi$predict)
+  hist(dl_predi$predict)
+  
+  Iso_PRT_Table$Score_RF <- rf_predi$predict
+  Iso_PRT_Table$Score_DL <- dl_predi$predict
+  print("Calculating Quantile Scores3")
+  Iso_PRT_Table_mPeakScore <-Iso_PRT_Table[,{list(dl=median(Score_DL,na.rm = T),
+                                                  rf=median(Score_RF,na.rm = T),
+                                                  dl_80 = quantile(Score_DL,0.8),
+                                                  dl_20 = quantile(Score_DL,0.2),
+                                                  rf_80 = quantile(Score_RF,0.8),
+                                                  rf_20 = quantile(Score_RF,0.2)
+  )},.(ENS,PeakfinderSet,UsedClusters,Peak)]
+
+  PeakID <- paste(Iso_PRT$ENS,
+                  Iso_PRT$UsedClusters,
+                  Iso_PRT$PeakfinderSet,
+                  unlist(Iso_PRT$Peak))
+  PeakID2 <- paste(Iso_PRT_Table_mPeakScore$ENS,
+                   Iso_PRT_Table_mPeakScore$UsedClusters,
+                   Iso_PRT_Table_mPeakScore$PeakfinderSet,
+                   Iso_PRT_Table_mPeakScore$Peak)
+  venn(list(PeakID,PeakID2))
+  
+  Iso_PRT$PeakScore_RF <- Iso_PRT_Table_mPeakScore$rf[match(PeakID,PeakID2)]
+  Iso_PRT$PeakScore_DL <- Iso_PRT_Table_mPeakScore$dl[match(PeakID,PeakID2)]
+  Iso_PRT$PeakScore_RF_80<- Iso_PRT_Table_mPeakScore$rf_80[match(PeakID,PeakID2)]
+  Iso_PRT$PeakScore_DL_80<- Iso_PRT_Table_mPeakScore$dl_80[match(PeakID,PeakID2)]
+  Iso_PRT$PeakScore_RF_20<- Iso_PRT_Table_mPeakScore$rf_20[match(PeakID,PeakID2)]
+  Iso_PRT$PeakScore_DL_20<- Iso_PRT_Table_mPeakScore$dl_20[match(PeakID,PeakID2)]
+  input$IsoFrac_PeakResultsTable <- Iso_PRT
+  input
+})
+
+TableListNormEnsHdbScanMW_Peaks <- lapply(1:length(gels),function(it){
+  
+  input <- TableListNormEnsHdbScanMW_Peaks[[it]]
+  input$xname_original <- gels[it]
+  input$xname <- gelNames[it]
+  input
+})
+ipr <- TableListNormEnsHdbScanMW_Peaks[[1]]$IsoFrac_PeakResultsTable
+ipr[grep("109320",ENS),]
+checkClusterLengths(TableListNormEnsHdbScanMW_Peaks[[1]])
+
+# combining PeakResultTables from all gels
+TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){
+  x$hdbscanTables$cl_2[x$hdbscanTables$cl_2=="SUB0"] <- "0"
+  x$hdbscanTables$cl_2[x$hdbscanTables_random$cl_2=="SUB0"] <- "0"
+
+  x$IsoFrac_PeakResultsTable$cluster2[x$IsoFrac_PeakResultsTable$cluster2=="SUB0"] <- "0"
+  x$IsoFrac_PeakResultsTable_random$cluster2[x$IsoFrac_PeakResultsTable_random$cluster2=="SUB0"] <- "0"
+
+  x
+})  
+
+save(TableListNormEnsHdbScanMW_Peaks,file="TableListNormEnsHdbScanMW_Peaks_NW_PR.rda") 
+
+}else{
+  load("TableListNormEnsHdbScanMW_Peaks_NW_PR.rda")
+}
+table(TableListNormEnsHdbScanMW_Peaks[[1]]$InputTable$SearchSpecificity)
+hdbscanTables <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){
+  x <<- x
+  xtemp <- x$hdbscanTables
+  xtemp$Abu <- as.numeric(xtemp$Abu)
+  xtemp$Gel <- x$xname
+  xtemp
+})
+IsoPR <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){
+  x <<- x
+  xtemp <- x$IsoFrac_PeakResultsTable
+  xtemp$Abu <- as.numeric(xtemp$Abu)
+  xtemp$Gel <- x$xname
+  xtemp
+})
+IsoPR <- rbindlist(IsoPR)
+IsoPR[ENS=="ENSG00000127603",length(unique(cluster2)),.(Gel)]
+
+hdbscanTables <- rbindlist(hdbscanTables)
+hdbscanTables[EnsG=="ENSG00000127603",length(unique(BestCluster)),.(Gel)]
+hdbscanTables$cl_2==hdbscanTables$BestCluster
+
+checkClusterLengths(TableListNormEnsHdbScanMW_Peaks[[1]])
+
+IsofracList <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){x$IsoFrac_PeakResultsTable$gel <- x$xname;x$IsoFrac_PeakResultsTable})
+IsofracTab <- rbindlist(IsofracList)
+ggplot(IsofracTab,aes(PeakScore_DL,fill=gel))+geom_density(alpha=0.5)+ggtitle("PeakScore RandomForest Model")+xlab("Peak Quality Score")
+  
+ggplot(IsofracTab,aes(PeakScore_RF,fill=gel))+geom_density(alpha=0.5)+ggtitle("DeepLearning RandomForest Model")+xlab("Peak Quality Score")
+
+
+print(paste("Loaded TableListNormEnsHdbScanMW_Peaks_NW_PR.rda from ",file.info("TableListNormEnsHdbScanMW_Peaks_NW_PR.rda")$mtime))
+
+
+```
+## Generating Slim Version of ListObject for IsoFracViewer
+
+-   Keeps only Plotting relevant data
+-   Improves performance of the viewer
+
+```{r Cleaning}
+print("Done Loading Data")
+TableListNormEnsHdbScanMW_PeaksSlim <- lapply(TableListNormEnsHdbScanMW_Peaks,function(x){
+  x <- x
+  
+  list(xname=x$xname,
+       dt_gn=x$dt_gn,
+       TMTSubset_final_singlenorm_zscore=x$TMTSubset_final_singlenorm_zscore,
+       hdbscanTables=x$hdbscanTables,
+       IsoFrac_PeakResultsTable=x$IsoFrac_PeakResultsTable,
+       MW_Predictor=x$MW_Predictor,
+       MW_Predictor_addon=x$MW_Predictor_addon,
+       IdentifiedPeaks_Table=x$IdentifiedPeaks_Table,
+       NetworkTables=x$NetworkTables,
+       InBothPlexes=x$InBothPlexes
+  )
+  
+})
+FractionsToMWList  <- lapply(Models,function(x){predict(x$MW_Predictor,1:30)})
+      save(FractionsToMWList,file=paste(".","FractionsToMWList.rda",sep = "/"))
+      
+TableListNormEnsHdbScanMW_PeaksSlim <-  lapply(1:length(TableListNormEnsHdbScanMW_PeaksSlim),function(it){
+  input <- TableListNormEnsHdbScanMW_PeaksSlim[[it]]
+  predicted <- FractionsToMWList[[it]]
+  input$Fractions_predicted_MW <- predicted
+  input
+})
+
+
+
+s <- sapply(TableListNormEnsHdbScanMW_PeaksSlim,function(x){x$xname})
+TableListNormEnsHdbScanMW_PeaksSlim <- lapply(1:length(gels),function(it){
+  
+  input <- TableListNormEnsHdbScanMW_PeaksSlim[[it]]
+  input$xname_original <- gels[it]
+  input$xname <- gelNames[it]
+  input
+})
+
+
+save(TableListNormEnsHdbScanMW_PeaksSlim,file="./TableListNormEnsHdbScanMW_PeaksSlim.rda")
+print(paste("Generated TableListNormEnsHdbScanMW_PeaksSlim.rda on",file.info("TableListNormEnsHdbScanMW_PeaksSlim.rda")$mtime))
+
+
+```
