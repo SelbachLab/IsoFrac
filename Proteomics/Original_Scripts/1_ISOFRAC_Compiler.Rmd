@@ -17,574 +17,621 @@ editor_options:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
-# UPDATE
-This version will improve the Gene Identifiers. SNP splits will be unified by Gene_Symbols
+# OVERVIEW
 
-# Purpose: Preparation of results for IsoFrac Viewer Tool (Step 1 from 2)
--  Reading peptides.txt from MQ
--  TMT Batch correction (peptide specific)
--  Zero Neighbour Regression
--  zscoring
--  IDmapping (Uniprot, BioMart for ENSG and HGNC Entries)
--  Clustering (hdbscan)
--  MW Mapping (loess Fraction ~ MW)
-- improved hdbscan: Multi Round Clustering if too many peptides fall into one cluster
+This RMarkdown implements **Step 1** of the IsoFrac result preparation pipeline (preparing data for the interactive IsoFrac viewer). It documents the data-processing steps used in the manuscript and produces intermediate objects for the peak-finder / isoform-calling module.
+
+Main tasks performed here:
+- Read `peptides.txt` output from MaxQuant (TMT experiments).
+- TMT batch correction and per-peptide normalization.
+- Missing-value handling (local linear interpolation for flank-missing values).
+- Z-scoring of fractionation traces.
+- Remapping peptide sequences to gene identifiers (UniProt / Ensembl / HGNC).
+- Gene-centric peptide clustering (HDBSCAN) to group co-eluting peptides into candidate protein isoform peaks.
+- Fraction → molecular-weight (MW) modeling using loess on annotated proteins.
+- Peak consolidation (merging redundant clusters across clusters/gels) and generation of IsoFrac candidate protein isoform
+- Export of results for the IsoFrac GUI (Step 2).
+
+Notes:
+- We use the term **protein isoform** in the script to denote an experimentally observed molecular-weight–resolved protein species (see manuscript nomenclature). When matched to transcript/protein database entries we call that an **ORF assignment** or **best-match**.
+- This script focuses on reproducible, conservative automated calls; borderline or low-confidence events are left for manual inspection via the GUI.
 
 
 ## Initialization
 Setting working directory, naming, combining experiments (e.g. Trypsin and Chymotrpysin)
+
 ```{r Initializaition, message=TRUE, warning=FALSE, , echo=T}
+## Initialization
+# Set working directory and load libraries.
+# `li1` lists the peptide.txt files (one file per experiment / gel).
+# Files are processed separately (one MaxQuant run per gel), then combined downstream.
+
 library(ggplot2)
 library(data.table)
-require(gtools)
+library(gtools)
 library(dbscan)
 library(parallel)
 library(h2o)
 library(pheatmap)
-setwd("./")
 
+setwd("./")
 MainWD <- getwd()
 
-li1 <- c("txt_2020_12_23_TMTpro_10per_MBR/peptides.txt",
-            "txt_2020_12_23_TMTpro_8per_MBR/peptides.txt",
-            "txt_2021_01_30_TMTpro_5er_MBR/peptides.txt")
+li1 <- c(
+  "txt_2020_12_23_TMTpro_10per_MBR/peptides.txt",
+  "txt_2020_12_23_TMTpro_8per_MBR/peptides.txt",
+  "txt_2021_01_30_TMTpro_5er_MBR/peptides.txt"
+)
+
 li1 <- rev(li1)
-
-
 ```
 
 
-## Functions
 
-Loading different helper functions. 
+## Helper functions
+ The following functions perform:
+ - mapping from UniProt identifiers to Ensembl/HGNC using biomaRt,
+ - neighbour-based linear imputation for missing fraction intensities,
+ - plotting utilities for fraction traces,
+ - wrappers around HDBSCAN with multi-round refinement logic.
 
+ These functions are used later by the ApplyHdbscanIsofrac_v2 pipeline.
 
 ```{r}
-# functions -------------
-RetrieveENSGfromUni <- function(x){
-  xsplit <- strsplit(x,";")
-  # xsplituni <- unique(unlist(xsplit))
-  xsplituniClean <- lapply(xsplit,function(x){x <- gsub("-.*.|_.*.","",x);gsub("^Cont_","",x)})
+# RetrieveENSGfromUni()
+# Map UniProt protein identifiers (accessions listed in MaxQuant `Proteins` field)
+# to Ensembl gene IDs and HGNC symbols using biomaRt. Handles SwissProt, TrEMBL
+# and gene-centric UniProt accessions where possible. Returns a table with:
+#   - UniprotAccession, hgnc_symbol, ensembl_gene_id, OriginalID (original Proteins field)
+# This mapping is used to perform the downstream gene-centric analyses.
+
+RetrieveENSGfromUni <- function(x) {
+  xsplit <- strsplit(x, ";")
+
+  xsplituniClean <- lapply(xsplit, function(x) {
+    x <- gsub("-.*.|_.*.", "", x)
+    gsub("^Cont_", "", x)
+  })
 
   xsplituniCleanUni <- unique(unlist(xsplituniClean))
+
   library(biomaRt)
   rm("mart.hs")
-  if(!exists("mart.hs")){
-      mart.hs <- useMart("ensembl", "hsapiens_gene_ensembl")
-  } 
+
+  if (!exists("mart.hs")) {
+    mart.hs <- useMart("ensembl", "hsapiens_gene_ensembl")
+  }
+
   li <- listAttributes(mart.hs)
   fi <- listFilters(mart.hs)
-  fi[grep("hgnc",fi[,2],value=F,ignore.case = T),]
-  fi[grep("UniProt",fi[,2],value=F,ignore.case = T),]
 
-  # grep("UniProt",fi[,2],value=T)
+  biomartCacheClear()
 
-    # try({getBM(attributes = c("ensembl_gene_id","goslim_goa_accession","name_1006","namespace_1003","go_id","goslim_goa_description"), filters = "ensembl_gene_id", values =unique(diffis) ,useCache = T, mart = mart.hs)})
-    biomartCacheClear()
+  try({
+    up <- getBM(
+      attributes = c("uniprotswissprot", "hgnc_symbol"),
+      filters = "uniprotswissprot",
+      values = xsplituniCleanUni,
+      useCache = TRUE,
+      mart = mart.hs
+    )
+  })
 
-      try({up <- getBM(attributes = c("uniprotswissprot","hgnc_symbol"), filters = "uniprotswissprot", values =xsplituniCleanUni ,useCache = T, mart = mart.hs)})
-        # try({upENSG <- getBM(attributes = c("ensembl_gene_id","uniprotswissprot","hgnc_symbol"), filters = "uniprotswissprot", values =xsplituniCleanUni ,useCache = T, mart = mart.hs)})
+  try({
+    tr <- getBM(
+      attributes = c("uniprotsptrembl", "hgnc_symbol"),
+      filters = "uniprotswissprot",
+      values = setdiff(xsplituniCleanUni, up$uniprotswissprot),
+      useCache = TRUE,
+      mart = mart.hs
+    )
+  })
 
-      try({tr <- getBM(attributes = c("uniprotsptrembl","hgnc_symbol"), filters = "uniprotswissprot", values =setdiff(xsplituniCleanUni,up$uniprotswissprot) ,useCache = T, mart = mart.hs)})
-      try({uGid <- getBM(attributes = c("uniprot_gn_id","hgnc_symbol"), filters = "uniprot_gn_id", values =setdiff(xsplituniCleanUni,up$uniprotswissprot) ,useCache = T, mart = mart.hs)})
-     # try({uGS <- getBM(attributes = c("uniprot_isoform","hgnc_symbol"), filters = "uniprot_isoform", values =setdiff(xsplituniCleanUni,up$uniprotswissprot) ,useCache = T, mart = mart.hs)})
+  try({
+    uGid <- getBM(
+      attributes = c("uniprot_gn_id", "hgnc_symbol"),
+      filters = "uniprot_gn_id",
+      values = setdiff(xsplituniCleanUni, up$uniprotswissprot),
+      useCache = TRUE,
+      mart = mart.hs
+    )
+  })
 
-    
-    up$UniprotAccession <- up$uniprotswissprot
-    up$uniprotswissprot <- NULL
-    tr$UniprotAccession <- tr$uniprotsptrembl
-    tr$uniprotsptrembl <- NULL
-    uGid$UniprotAccession <- uGid$uniprot_gn_id
-    uGid$uniprot_gn_id <- NULL
-    IDs <- rbind(up,tr,uGid)
-    IDs <- IDs[IDs$hgnc_symbol!="",]
+  up$UniprotAccession <- up$uniprotswissprot
+  up$uniprotswissprot <- NULL
 
-  
-    try({ENSG <- getBM(attributes = c("ensembl_gene_id","hgnc_symbol"), filters = "hgnc_symbol", values =IDs$hgnc_symbol ,useCache = T, mart = mart.hs)})
-    
-    combitable <- merge(IDs,ENSG,by = "hgnc_symbol",all = T)
-    
-# 
-# 
-#     missing <- setdiff(xsplituniCleanUni,up$UniprotAccession)
-#     try({tr <- getBM(attributes = c("uniprotsptrembl","uniprot_gn_id","ensembl_gene_id","hgnc_symbol"), filters = "uniprotsptrembl", values =missing ,useCache = T, mart = mart.hs)})
-#     tr$UniprotAccession <- tr$uniprotsptrembl
-#     tr$uniprotsptrembl <- NULL
-#     missing <- setdiff(missing,tr$UniprotAccession)
-    
-    # combitable <- rbind(tr,up)
-    # combitable <- as.data.table(combitable)
-    # combitable <- rbind(combitable,data.table(UniprotAccession=missing),fill=T)
-    # # table(combitable$ensembl_gene_id=="")
-    # table(=="")
-    combitable <- as.data.table(combitable)
+  tr$UniprotAccession <- tr$uniprotsptrembl
+  tr$uniprotsptrembl <- NULL
 
-    humpe <- lapply(xsplituniClean,function(x){
-      x <- x
-      returnFun <- apply(combitable[match(x,UniprotAccession)],2,function(x){
-        x <- x[x!=""]
-      paste( sort( unique(x)),collapse=";")
-      })
-      as.list(returnFun)
+  uGid$UniprotAccession <- uGid$uniprot_gn_id
+  uGid$uniprot_gn_id <- NULL
+
+  IDs <- rbind(up, tr, uGid)
+  IDs <- IDs[IDs$hgnc_symbol != "", ]
+
+  try({
+    ENSG <- getBM(
+      attributes = c("ensembl_gene_id", "hgnc_symbol"),
+      filters = "hgnc_symbol",
+      values = IDs$hgnc_symbol,
+      useCache = TRUE,
+      mart = mart.hs
+    )
+  })
+
+  combitable <- merge(IDs, ENSG, by = "hgnc_symbol", all = TRUE)
+
+  combitable <- as.data.table(combitable)
+
+  humpe <- lapply(xsplituniClean, function(x) {
+    returnFun <- apply(combitable[match(x, UniprotAccession)], 2, function(x) {
+      x <- x[x != ""]
+      paste(sort(unique(x)), collapse = ";")
     })
-    UP <- rbindlist(humpe)
-    UP$OriginalID <- x
+    as.list(returnFun)
+  })
 
-UP
-    
+  UP <- rbindlist(humpe)
+  UP$OriginalID <- x
 
+  UP
 }
- # PGsuniENSG <- RetrieveENSGfromUni(PGsuni)
- # stop()
 
-Neighbour_Mean_imputation <- function(rawda,zerosToNas=T){
-  
-  rawdanew <- apply(rawda,1,function(xu){
-    xu <- xu
-    if(zerosToNas){
-      xu[xu ==0] <- NA
+
+# Neighbour_Mean_imputation()
+# Linear interpolation imputation for internal missing values in peptide fraction traces.
+# - Only imputes missing values that are flanked by quantified neighbour fractions.
+# - Does NOT extrapolate at trace edges (no neighbouring fraction available).
+# - This keeps the original elution shape and reduces artifactual single-fraction peaks.
+
+Neighbour_Mean_imputation <- function(rawda, zerosToNas = TRUE) {
+  rawdanew <- apply(rawda, 1, function(xu) {
+    if (zerosToNas) {
+      xu[xu == 0] <- NA
     }
+
     NAs <- which(!is.na(xu))
-    if(any(is.na(xu))){
-      repi <- sapply(1:length(xu),function(y){
+
+    if (any(is.na(xu))) {
+      repi <- sapply(seq_along(xu), function(y) {
         v1 <- xu[y]
-        y <- y
-        if(is.na(v1)){
-          mi <- max(NAs[NAs<y])
-          ma <- min(NAs[NAs>y])
-          v1 <- mean(xu[c(mi,ma)],na.rm = T)
+        if (is.na(v1)) {
+          mi <- max(NAs[NAs < y])
+          ma <- min(NAs[NAs > y])
+          v1 <- mean(xu[c(mi, ma)], na.rm = TRUE)
         }
         v1
-        
       })
-      
-    }else{
+    } else {
       repi <- xu
     }
+
+    repi
   })
+
   rawdanew <- t(rawdanew)
   rawda <- data.table(rawdanew)
   rawda
 }
 
-Gpplot_LineTraces <- function(da,gti="",applyhdbclust= T,pointsset=2,applyscale = T,col = NULL,smoothtable=F){
+
+# Gpplot_LineTraces()
+# Diagnostic plotting helper for visualizing peptide fractionation traces.
+# Options:
+# - applyscale: whether to z-score each trace before plotting.
+# - applyhdbclust: overlay clustering assignments (for quick QC).
+# - smoothtable: optional Savitzky-Golay smoothing for visualization only (not used in automated calls).
+
+Gpplot_LineTraces <- function(da, gti = "", applyhdbclust = TRUE, pointsset = 2,
+                              applyscale = TRUE, col = NULL, smoothtable = FALSE) {
   da <- da
-  if(applyscale){
+
+  if (applyscale) {
     da <- data.frame(da)
-    da[is.na(da)] <- 
-      da <- t(scale(t(da)))
+    da[is.na(da)] <- NA
+    da <- t(scale(t(da)))
     da <- data.table(da)
   }
-  
-  if(length(da$TYPE)==0){
+
+  if (length(da$TYPE) == 0) {
     da$TYPE <- 1:dim(da)[1]
-  }  
-  if(applyhdbclust){
+  }
+
+  if (applyhdbclust) {
     temp <- da
-    temp <-as.data.frame(temp)
-    temp[is.na(temp)] <- quantile(temp,probs = 0.2,na.rm = T)
+    temp <- as.data.frame(temp)
+    temp[is.na(temp)] <- quantile(temp, probs = 0.2, na.rm = TRUE)
     temp$TYPE <- NULL
     library(dbscan)
-    cl <- hdbscan(temp,pointsset)$cluster
+    cl <- hdbscan(temp, pointsset)$cluster
     da$cluster <- cl
-  }else{
+  } else {
     da$cluster <- 1
-    if(length(col)==dim(da)[1]){
+    if (length(col) == dim(da)[1]) {
       da$cluster <- col
     }
   }
-  
+
   da$cluster <- as.character(da$cluster)
-  te <- melt(da,id.vars = c("TYPE","cluster"))
-  
-  if(smoothtable){
-    te[,value:={
-      pracma::savgol(value,11,forder= 4,dorder=0)
-    },.(TYPE,cluster)]
+  te <- melt(da, id.vars = c("TYPE", "cluster"))
+
+  if (smoothtable) {
+    te[, value := {
+      pracma::savgol(value, 11, forder = 4, dorder = 0)
+    }, .(TYPE, cluster)]
   }
-  
-  g1 <- ggplot(te,aes(variable,value,group = TYPE,col =cluster))+geom_line()+ggtitle(gti)
+
+  g1 <- ggplot(te, aes(variable, value, group = TYPE, col = cluster)) +
+    geom_line() +
+    ggtitle(gti)
+
   g1
 }
-CheckHdbscan_plot <- function(input,ens="ENSG00000120802"){
+
+
+CheckHdbscan_plot <- function(input, ens = "ENSG00000120802") {
   dt <- input$TMTSubset_final_singlenorm_zscore
   ids <- 1:dim(dt)[1]
-  input$hdbscanTables <- input$hdbscanTables[match(ids,input$hdbscanTables$id),]
+  input$hdbscanTables <- input$hdbscanTables[match(ids, input$hdbscanTables$id), ]
   input$hdbscanTables$id
   gn <- input$dt_gn
-  
-  sel <- gn$ens==ens
-  cl <- input$hdbscanTables[sel,]
-  Gpplot_LineTraces(dt[sel,],col=cl$cl_3,applyhdbclust=F,applyscale = F)
-  # try(hdb2 <- hdbscan(dt[sel,],2),silent = T)
-  # Gpplot_LineTraces(dt[sel,],col=hdb2$cluster,applyhdbclust=F)
+
+  sel <- gn$ens == ens
+  cl <- input$hdbscanTables[sel, ]
+  Gpplot_LineTraces(dt[sel, ], col = cl$cl_3, applyhdbclust = FALSE, applyscale = FALSE)
+
 }
 
-removenoisetable_hdbscan <- function(hdbresult,noiseids=1:20){
-  # hdbresult <<- hdbresult
+
+removenoisetable_hdbscan <- function(hdbresult, noiseids = 1:20) {
   hdbresult$cluster <- hdbresult$cluster[-noiseids]
   hdbresult$membership_prob <- hdbresult$membership_prob[-noiseids]
   hdbresult$outlier_scores <- hdbresult$outlier_scores[-noiseids]
   hdbresult$sh <- hdbresult$sh[-noiseids]
   hdbresult$coredist <- hdbresult$coredist[-noiseids]
-  
+
   hdbresult
-} 
-  
-  RerunHighClusters <- function(hdb2,datemp,dbset,removenoise=T,PeptideThresh=30, shTresh = 0.5){
-    clv <- table(hdb2$cluster)
-    if(any(clv>PeptideThresh)){
-      for(i in names(clv)[clv>PeptideThresh]){
-        sel <- hdb2$cluster==i
-        if(median(hdb2$sh[sel],na.rm=T)<shTresh){
-          if(removenoise){
-            sel2 <- c(rep(T,20),sel)
-          }else{
-            sel2 <- sel
-          }
-          # print(length(CCsel2))
-          hdb2_rerun <- hdb2
-          hdb2_rerun$sh <- -100
-          
-          hdb2_rerun <- hdbwrapper_low(datemp[sel2,],dbset,removenoise = removenoise)
-          # try({ hdb2_rerun$sh <- silhouette(hdb2_rerun$cluster, dist(datemp[sel2],]))[,3]},silent=silentCheck)
-          
-          # print(dim(datemp))
-          # print(sum(sel2))
-          # 
-          # print(length(hdb2$cluster))
-          # print(length(hdb2_rerun$cluster))
-          # sel <<- selC
-          # hdb2 <<- hdb2
-          # hdb2_rerun <<- hdb2_rerun
-          # length(hdb2$cluster[sel])
-          # length(hdb2_rerun$cluster)
-          hdb2$cluster[sel] <- paste("SUB",hdb2_rerun$cluster,sep="")
-          hdb2$sh[sel] <- hdb2_rerun$sh
-          hdb2$coredist[sel] <- hdb2_rerun$coredist
-          names(hdb2_rerun$cluster_scores) <- paste("SUB",names(hdb2_rerun$cluster_scores),sep="")
-          hdb2$cluster_scores <-c(hdb2$cluster_scores, hdb2_rerun$cluster_scores)
-          
-          hdb2$membership_prob[sel] <- hdb2_rerun$membership_prob
-          hdb2$outlier_scores[sel] <- hdb2_rerun$outlier_scores
-          
-          
+}
+
+
+RerunHighClusters <- function(hdb2, datemp, dbset, removenoise = TRUE,
+                              PeptideThresh = 30, shTresh = 0.5) {
+  clv <- table(hdb2$cluster)
+
+  if (any(clv > PeptideThresh)) {
+    for (i in names(clv)[clv > PeptideThresh]) {
+      sel <- hdb2$cluster == i
+
+      if (median(hdb2$sh[sel], na.rm = TRUE) < shTresh) {
+        if (removenoise) {
+          sel2 <- c(rep(TRUE, 20), sel)
+        } else {
+          sel2 <- sel
         }
-        
+
+        hdb2_rerun <- hdb2
+        hdb2_rerun$sh <- -100
+
+        hdb2_rerun <- hdbwrapper_low(datemp[sel2, ], dbset, removenoise = removenoise)
+
+        hdb2$cluster[sel] <- paste("SUB", hdb2_rerun$cluster, sep = "")
+        hdb2$sh[sel] <- hdb2_rerun$sh
+        hdb2$coredist[sel] <- hdb2_rerun$coredist
+
+        names(hdb2_rerun$cluster_scores) <- paste("SUB", names(hdb2_rerun$cluster_scores), sep = "")
+        hdb2$cluster_scores <- c(hdb2$cluster_scores, hdb2_rerun$cluster_scores)
+
+        hdb2$membership_prob[sel] <- hdb2_rerun$membership_prob
+        hdb2$outlier_scores[sel] <- hdb2_rerun$outlier_scores
       }
-      
     }
-    
-    hdb2
   }
-  hdbwrapper_low <- function(datemp,dbset=2,removenoise=T,silentCheck=T){
-    rm("input")
-    try(input <- hdbscan(datemp,dbset),silent =silentCheck)
-    # print(length(input$cluster))
-    if(exists("input")){
-      if(removenoise){
-        input <- removenoisetable_hdbscan(input)
-        input$sh <- rep(-100,length(input$cluster))
-        try({ input$sh <- silhouette(input$cluster, dist(datemp[-(1:20),]))[,3]},silent=silentCheck)
-        
-      }else{
-        input$sh <- rep(-100,length(input$cluster))
-        
-        try({ input$sh <- silhouette(input$cluster, dist(datemp))[,3]},silent=silentCheck)
-        
-      }
-    }else{
-      input <- NULL
+
+  hdb2
+}
+
+
+hdbwrapper_low <- function(datemp, dbset = 2, removenoise = TRUE, silentCheck = TRUE) {
+  rm("input")
+  try(input <- hdbscan(datemp, dbset), silent = silentCheck)
+
+  if (exists("input")) {
+    if (removenoise) {
+      input <- removenoisetable_hdbscan(input)
+      input$sh <- rep(-100, length(input$cluster))
+      try({
+        input$sh <- silhouette(input$cluster, dist(datemp[-(1:20), ]))[, 3]
+      }, silent = silentCheck)
+    } else {
+      input$sh <- rep(-100, length(input$cluster))
+      try({
+        input$sh <- silhouette(input$cluster, dist(datemp))[, 3]
+      }, silent = silentCheck)
     }
-    
-    input
-    
+  } else {
+    input <- NULL
   }
-  
-ApplyHdbscanIsofrac_v2 <- function(x,randomize=F,ApplySmooth=F,filterLength=11,test = F,seed = 1234){
+
+  input
+}
+
+
+# ApplyHdbscanIsofrac_v2()
+# Main gene-centric clustering wrapper.
+# For each gene (grouping by ENSG) we:
+# 1) select peptide z-score traces,
+# 2) optionally smooth for QC (not for automated assignment),
+# 3) run HDBSCAN with multiple minPts settings (minPts = 2 and 3),
+# 4) compute silhouette metrics and choose the best clustering per gene,
+# 5) mark traces assigned to cluster 0 as noise (excluded from automated peak-calling).
+#
+# Rationale for HDBSCAN:
+# - density-based clustering captures co-elution of peptide subsets without pre-specifying cluster counts,
+# - it flags inconsistent/isolated traces as noise (reducing single-peptide false positives),
+# - the multi-round re-clustering step refines very large clusters to improve resolution.
+#
+# Output: per-gene table of cluster assignments, cluster quality metrics, and cluster-level summary stats.
+
+ApplyHdbscanIsofrac_v2 <- function(x, randomize = FALSE, ApplySmooth = FALSE,
+                                   filterLength = 11, test = FALSE, seed = 1234) {
   set.seed(seed)
-  print(paste("Round",x$xname))
+  print(paste("Round", x$xname))
+
   library(data.table)
   library(pracma)
   library(dbscan)
   library(cluster)
-  
+
   inputTable <- data.table(x$TMTSubset_final_singlenorm_zscore)
   inputTable$id <- 1:dim(inputTable)[1]
   inputTable$Sequence <- x$InputTable$Sequence
-  
+
   dt_gn <- x$dt_gn
   Abu <- as.numeric(as.character(x$InputTable$Intensity))
-  
+
   dt_gn$gn[is.na(dt_gn$gn)] <- "NOTMAPPED"
   inputTable$Abu <- Abu
   inputTable$ens <- dt_gn$ens
-  
+
   ImputSource <- inputTable
   ImputSource$id <- NULL
   ImputSource$Sequence <- NULL
   ImputSource$Abu <- NULL
   ImputSource$ens <- NULL
   ImputSel <- which(rowSums(ImputSource) == 0)
+
   ImputSource <- as.data.frame(ImputSource)
   ImputSource[is.na(ImputSource)] <- 0
   ImputSel <- which(rowSums(ImputSource) == 0)
-  
-  IT <- inputTable[,{
-    # cat("\r",.GRP)
+
+  IT <- inputTable[, {
     temp <- .SD
     temp2 <<- temp
-    # if(.BY$EnsG=="ENSG00000120802"){
-    #   temp <<- temp
-    #   tempbackup <- temp
-    # }
+
     id <- temp$id
     temp$id <- NULL
-    
+
     Abu <- as.numeric(as.character(temp$Abu))
     temp$Abu <- NULL
-    
+
     Seq <- temp$Sequence
     temp$Sequence <- NULL
-    
+
     temp <- data.frame(temp)
     temp[is.na(temp)] <- 0
-    
+
     # Filtering:
-    sel <- rowSums(temp)!=0
-    sel[is.na(sel)] <- F
-    remap <- (1:dim(temp)[1])
+    sel <- rowSums(temp) != 0
+    sel[is.na(sel)] <- FALSE
+
+    remap <- 1:dim(temp)[1]
     Ids <- remap[sel]
     remap[!sel] <- NA
     remap[sel] <- 1:sum(sel)
+
     id <- id[sel]
     Seq <- Seq[sel]
-    if(length(Seq)==0){
+
+    if (length(Seq) == 0) {
       li <- NULL
-    }else{
-      rm("hdb2","hdb3")
-      hdb2 <- list(cluster=0,cluster_scores=0,membership_prob=0,outlier_scores=0,sh=-100)
-      hdb3 <- list(cluster=0,cluster_scores=0,membership_prob=0,outlier_scores=0,sh=-100)
-      hdb2_nf <- list(cluster=0,cluster_scores=0,membership_prob=0,outlier_scores=0,sh=-100)
-      
-      hdb2 <- lapply(hdb2,rep,sum(sel))
-      hdb3 <- lapply(hdb3,rep,sum(sel))
-      if(randomize){
-        
+    } else {
+      rm("hdb2", "hdb3")
+
+      hdb2 <- list(cluster = 0, cluster_scores = 0, membership_prob = 0,
+                   outlier_scores = 0, sh = -100)
+      hdb3 <- list(cluster = 0, cluster_scores = 0, membership_prob = 0,
+                   outlier_scores = 0, sh = -100)
+      hdb2_nf <- list(cluster = 0, cluster_scores = 0, membership_prob = 0,
+                      outlier_scores = 0, sh = -100)
+
+      hdb2 <- lapply(hdb2, rep, sum(sel))
+      hdb3 <- lapply(hdb3, rep, sum(sel))
+
+      if (randomize) {
         re <- 1:dim(inputTable)[1]
-        # re2 <- setdiff(re,ImputSel)
-        wh <- which(dt_gn$ens==.BY$EnsG)
-        re <- setdiff(re,c(wh,ImputSel))
-        s <- sample(re,dim(temp)[1])
-        temp <- inputTable[s,]
+        wh <- which(dt_gn$ens == .BY$EnsG)
+        re <- setdiff(re, c(wh, ImputSel))
+        s <- sample(re, dim(temp)[1])
+        temp <- inputTable[s, ]
+
         any(is.na(temp))
         Abu <- inputTable$Abu[s]
+
         temp$id <- NULL
         temp$Sequence <- NULL
         temp$ens <- NULL
         temp$Abu <- NULL
         temp$Sequence <- NULL
-        
       }
-      
+
       try({
-        
-        
-        if(ApplySmooth){
+        if (ApplySmooth) {
           library(pracma)
-          temp <- apply(temp,1,savgol,fl=filterLength,forder= 4,dorder=0)
+          temp <- apply(temp, 1, savgol, fl = filterLength, forder = 4, dorder = 0)
           temp <- t(temp)
         }
-        
-        da <- data.frame(temp[sel,])
+
+        da <- data.frame(temp[sel, ])
         da <- data.table(da)
+
         # adding noise:
-        if(1){
-          noisetable <- rep(-1,dim(da)[2])
-          noitab <- sapply(1:20,function(x){
-            jitter(noisetable,amount = 0.5)
+        if (1) {
+          noisetable <- rep(-1, dim(da)[2])
+          noitab <- sapply(1:20, function(x) {
+            jitter(noisetable, amount = 0.5)
           })
           noitab <- t(noitab)
           colnames(noitab) <- colnames(da)
-          da2 <- rbind(noitab,da)
-        }else{
+          da2 <- rbind(noitab, da)
+        } else {
           da2 <- da
-          
         }
-        
-        Cumulative_Diff <- apply(da,1,function(x){
-          x <- x
-          lengthCheck <- names(table(x))[table(x)>=14]
-          
-          if(length(lengthCheck)>0){
-            correctionFactor <- length(x[x!=lengthCheck])
-          }else{
+
+        Cumulative_Diff <- apply(da, 1, function(x) {
+          lengthCheck <- names(table(x))[table(x) >= 14]
+
+          if (length(lengthCheck) > 0) {
+            correctionFactor <- length(x[x != lengthCheck])
+          } else {
             correctionFactor <- length(x)
           }
-          
-          c(abs(sum(diff(x))),
-            sd(x,na.rm=T))/correctionFactor
-          
+
+          c(abs(sum(diff(x))), sd(x, na.rm = TRUE)) / correctionFactor
         })
+
         Cumulative_Diff <- t(Cumulative_Diff)
         Cumulative_Diff <- data.frame(Cumulative_Diff)
-        if(length(Cumulative_Diff)>0){
-          Cumulative_Diff$X1[Cumulative_Diff$X1==0] <- as.double(NA)
-          Cumulative_Diff$X2[Cumulative_Diff$X2==0] <- as.double(NA)
-        }else{
-          
+
+        if (length(Cumulative_Diff) > 0) {
+          Cumulative_Diff$X1[Cumulative_Diff$X1 == 0] <- as.double(NA)
+          Cumulative_Diff$X2[Cumulative_Diff$X2 == 0] <- as.double(NA)
         }
-        
-        
-        
-        
-        hdb2 <- hdbwrapper_low(da2,2)
-        if(any(table(hdb2$cluster)>30)){
+
+        hdb2 <- hdbwrapper_low(da2, 2)
+        if (any(table(hdb2$cluster) > 30)) {
           print("rerunning hdb2")
-          hdb2 <- RerunHighClusters(hdb2,da2,2)
+          hdb2 <- RerunHighClusters(hdb2, da2, 2)
         }
-        # table(hdb2$cluster)
-        # table(hdb2$sh)
-        
-        hdb3 <- hdbwrapper_low(da2,3)
-        if(any(table(hdb3$cluster)>30)){
+
+        hdb3 <- hdbwrapper_low(da2, 3)
+        if (any(table(hdb3$cluster) > 30)) {
           print("rerunning hdb3")
-          
-          hdb3 <- RerunHighClusters(hdb3,da2,3)
+          hdb3 <- RerunHighClusters(hdb3, da2, 3)
         }
-        # table(hdb3$cluster)
-        
-        hdb2_nf <- hdbwrapper_low(da,2,removenoise = F)
-        if(any(table(hdb2_nf$cluster)>30)){
+
+        hdb2_nf <- hdbwrapper_low(da, 2, removenoise = FALSE)
+        if (any(table(hdb2_nf$cluster) > 30)) {
           print("rerunning hdb2_nf")
-          # hdb2_nf <<- hdb2_nf
-          hdb2_nf <- RerunHighClusters(hdb2_nf,da,2,removenoise = F)
+          hdb2_nf <- RerunHighClusters(hdb2_nf, da, 2, removenoise = FALSE)
         }
-        # hdb2_nf$sh
-        
-        
-        
-        # plot(1,ylim=range(da2,na.rm = T),xlim = c(1,28))
-        # sapply(1:dim(da)[1],function(it){
-        #   points(unlist(da[it,]),type = "l",col=hdb2$cluster[it]+1)
-        #   legend("topright",legend=unique(hdb2$cluster),fill=unique(hdb2$cluster)+1,cex = 0.3)
-        #   NULL
-        # })
-        # 
-        
-        hdb2$cluster[is.na(hdb2$cluster)] <- -1 #<- as.double(NA)
-        hdb3$cluster[is.na(hdb3$cluster)] <- -1#<- as.double(NA)
+
+        hdb2$cluster[is.na(hdb2$cluster)] <- -1
+        hdb3$cluster[is.na(hdb3$cluster)] <- -1
         hdb2_nf$cluster[is.na(hdb2_nf$cluster)] <- -1
       })
+
       clusterReplace2 <- hdb2$cluster
       clusterReplace2_nf <- hdb2_nf$cluster
-      
       clusterReplace3 <- hdb3$cluster
-      clusterReplace2[clusterReplace2==0] <- NA
-      clusterReplace3[clusterReplace3==0] <- NA
-      if(length(hdb2$sh)==0){
+
+      clusterReplace2[clusterReplace2 == 0] <- NA
+      clusterReplace3[clusterReplace3 == 0] <- NA
+
+      if (length(hdb2$sh) == 0) {
         hdb2$sh <- as.double(NA)
       }
-      if(length(hdb2_nf$sh)==0){
+      if (length(hdb2_nf$sh) == 0) {
         hdb2_nf$sh <- as.double(NA)
       }
-      if(length(hdb3$sh)==0){
+      if (length(hdb3$sh) == 0) {
         hdb3$sh <- as.double(NA)
       }
-      # print("hu")
-      # print(length(hdb2$sh))
-      if(length(hdb2$cluster)==0){
-        hdb2 <- list(cluster=0,cluster_scores=0,membership_prob=0,outlier_scores=0,sh=-100,id=id,Abu=-100,Seq=Seq)
-        hdb3 <- list(cluster=0,cluster_scores=0,membership_prob=0,outlier_scores=0,sh=-100,id=id,Abu=-100,Seq=Seq)
-        hdb2_nf <- list(cluster=0,cluster_scores=0,membership_prob=0,outlier_scores=0,sh=-100,id=id,Abu=-100,Seq=Seq)
+
+      if (length(hdb2$cluster) == 0) {
+        hdb2 <- list(cluster = 0, cluster_scores = 0, membership_prob = 0,
+                     outlier_scores = 0, sh = -100, id = id, Abu = -100, Seq = Seq)
+        hdb3 <- list(cluster = 0, cluster_scores = 0, membership_prob = 0,
+                     outlier_scores = 0, sh = -100, id = id, Abu = -100, Seq = Seq)
+        hdb2_nf <- list(cluster = 0, cluster_scores = 0, membership_prob = 0,
+                        outlier_scores = 0, sh = -100, id = id, Abu = -100, Seq = Seq)
         AbuFun <- -100
-        Cumulative_Diff <- data.frame(X1=as.double(NA),X2=as.double(NA))
-      }else{
+        Cumulative_Diff <- data.frame(X1 = as.double(NA), X2 = as.double(NA))
+      } else {
         AbuFun <- Abu[sel]
       }
-      # print("hu")
-      # print()C
-      
-      li <- list(cl_2=as.character(hdb2$cluster),
-                 sc_2=hdb2$cluster_scores[clusterReplace2],
-                 mp_2 = hdb2$membership_prob,
-                 os_2 = hdb2$outlier_scores,
-                 sh_2=hdb2$sh,
-                 
-                 cl_2_nf=as.character(hdb2_nf$cluster),
-                 sc_2_nf=hdb2_nf$cluster_scores[clusterReplace2],
-                 mp_2_nf=hdb2_nf$membership_prob,
-                 os_2_nf=hdb2_nf$outlier_scores,
-                 sh_2_nf=hdb2_nf$sh,
-                 
-                 cl_3=as.character(hdb3$cluster),
-                 sc_3=hdb3$cluster_scores[clusterReplace3],
-                 mp_3 = hdb3$membership_prob,
-                 os_3 = hdb3$outlier_scores,
-                 sh_3 = hdb3$sh,
-                 
-                 Cumulative_Diff=Cumulative_Diff$X1,
-                 sd = Cumulative_Diff$X2,
-                 Abu = AbuFun,
-                 id=id,
-                 Seq = Seq
+
+      li <- list(
+        cl_2 = as.character(hdb2$cluster),
+        sc_2 = hdb2$cluster_scores[clusterReplace2],
+        mp_2 = hdb2$membership_prob,
+        os_2 = hdb2$outlier_scores,
+        sh_2 = hdb2$sh,
+
+        cl_2_nf = as.character(hdb2_nf$cluster),
+        sc_2_nf = hdb2_nf$cluster_scores[clusterReplace2],
+        mp_2_nf = hdb2_nf$membership_prob,
+        os_2_nf = hdb2_nf$outlier_scores,
+        sh_2_nf = hdb2_nf$sh,
+
+        cl_3 = as.character(hdb3$cluster),
+        sc_3 = hdb3$cluster_scores[clusterReplace3],
+        mp_3 = hdb3$membership_prob,
+        os_3 = hdb3$outlier_scores,
+        sh_3 = hdb3$sh,
+
+        Cumulative_Diff = Cumulative_Diff$X1,
+        sd = Cumulative_Diff$X2,
+        Abu = AbuFun,
+        id = id,
+        Seq = Seq
       )
     }
-    
-    
+
     li2 <<- li
-    # li[lengths(li)==0] <- 0
-    # print("hu")
-    
     li
-    
-    # g1 <- Gpplot_LineTraces(temp,alternativeClusters = li$cl_2,applyhdbclust=F)
-    # g2 <- Gpplot_LineTraces(temp,alternativeClusters = li$cl_3,applyhdbclust=F)
-    # 
-    # grid.arrange(g1,g2)
-    li
-  },.(EnsG=ens)]
-  # save(inputTable,IT,file="Image.test.rda")
-  # load("Image.test.rda")
-  # print("hu")
+
+  }, .(EnsG = ens)]
+
   IT <<- IT
   x$Smoothed <- ApplySmooth
   x$FilterLength <- filterLength
-  if(randomize){
-    if(ApplySmooth){
+
+  if (randomize) {
+    if (ApplySmooth) {
       x$hdbscanTables_smoothed_random <- IT
-      
-    }else{
+    } else {
       x$hdbscanTables_random <- IT
-      
     }
-    
-  }else{
-    if(ApplySmooth){
+  } else {
+    if (ApplySmooth) {
       x$hdbscanTables_smoothed <- IT
-      
-    }else{
+    } else {
       x$hdbscanTables <- IT
-      
     }
-    
   }
-  
+
   x
-  
 }
 
 ```
 
+## Data Normalization and Preprocessing Workflow
+### Peptide traces — definition and generation
 
-Loaded experiments:
+We define a **peptide trace** as the fraction-resolved intensity profile of a single peptide across the SDS-PAGE fractions (derived from MaxQuant reporter ion intensities). Important processing steps:
+- Each gel yields 28 fractions; two TMT plexes cover those fractions (see Methods).
+- Within each TMT experiment intensities are normalized to the experiment-specific reference channel.
+- Per-peptide traces are z-scored across fractions to emphasize elution shape over absolute abundance.
+- All peptide sequences are remapped to Ensembl gene IDs for gene-centric downstream analysis.
 
-## Normalization 
--  TMT batch correction
--  optional: zero neighbour imputation (mean value insertion for missing points from neighbouring points, only works for odd even experimental design)
--  zscoring
+### Missing-value handling
+
+Missing fraction intensities arise mainly from incomplete reporter-ion quantification (two-plex design) and stochastic DDA sampling. To preserve continuity of traces without introducing artificial peaks:
+- We impute internal missing values by linear interpolation between the immediate upstream and downstream quantified fractions.
+- Edge gaps (no available neighbour on one side) are **not** imputed.
+- Imputation is deliberately conservative to avoid creating spurious single-fraction peaks that would bias peak detection.
+
 ```{r Normalization, echo=T, message=FALSE, warning=FALSE }
-# setwd("./Experiments</")
 rerun <- T
 threads = 10
 reanalyse <- rerun
@@ -691,7 +738,14 @@ if(file.exists("./Experiments/TableListNorm.rda")|rerun){
       names(TMTSubset)
       TMTSubset_final <- TMTSubset[,.SD,.SDcols=grep("Std",names(TMTSubset),invert = T,value = T)]
       
-      #' Normalization
+      ## Normalization
+      # - TMT batch correction (per-peptide normalization using reference channels).
+      # - Optional zero-neighbour imputation for odd/even plex designs (applied only where valid).
+      # - Per-peptide z-scoring across fractions to make elution shape comparable across peptides.
+      # - Per-gene aggregation and QC metrics are saved for downstream clustering and peak-finding.
+      #
+      # Note: two separate plexes are a main source of missing values; this is handled by the above imputation
+      # strategy and by marking peptides absent in one plex as lower-confidence (flag `InBothPlexes`).
       #' 
       TMTSubset_STD <- TMTSubset[,.SD,.SDcols=grep("Std",names(TMTSubset),invert = F,value = T)]
       
@@ -811,7 +865,7 @@ if(file.exists("./Experiments/TableListNorm.rda")|rerun){
     save(TableListNorm,file="./Experiments/TableListNorm.rda")
   }
 }
-    # par(mfrow = c(2,3))
+
   AbunBinNorm <- lapply(TableListNorm,function(x){
     x <<- x
     p1 <- (x$TMTSubset_STD$P1_Std2)# even
@@ -832,9 +886,6 @@ if(file.exists("./Experiments/TableListNorm.rda")|rerun){
     abline(v=0,lty="dashed")
     points(pdat$V1,log10(pdat$su),type="l",col="2",lwd = 2)
     
-    # ggplot(pall,aes(log2.p2.vs.p1,log10(su),group=su))+geom_boxplot(width=1)+ggtitle(x$x)+ylab("binned log 10 Intensity")+
-    # geom_vline(xintercept = 0,lty= "dashed",color = "red")
-    # ggplot(pdat,aes(V1,log10(su)))+geom_point()+geom_vline(xintercept = 0,lty= "dashed")+ggtitle(gsub("/peptides.txt","",x$x))+ylab("log10 Intensity Bin")+xlab("Median log2 Plex2 / Plex1")
   })
   
    IDs <- sapply(TableListNorm,function(x){
@@ -851,7 +902,7 @@ if(file.exists("./Experiments/TableListNorm.rda")|rerun){
 ```
 
 
-```{r Identification plots, echo=T, message=FALSE, warning=FALSE,fig.show="hold",fig.cap="Identifation Counts, based on MQ output.", out.width="33%"  }
+```{r Identification plots, echo=T, message=FALSE, warning=FALSE,fig.show="hold",fig.cap="Identification counts based on MaxQuant output (unique sequences, leading razor proteins, and mapped genes).", out.width="33%"  }
 ggplot(IDs,aes(x=gsub("/peptides.txt","",name),y=LeadingRazor,fill=Date))+geom_bar(stat = "identity")+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+xlab("")+ggtitle("Leading Razor Proteins")
 
 ggplot(IDs,aes(x=gsub("/peptides.txt","",name),y=Sequence,fill=Date))+geom_bar(stat = "identity")+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+xlab("")+ggtitle("Unique Sequences")
@@ -860,17 +911,13 @@ ggplot(IDs,aes(x=gsub("/peptides.txt","",name),y=Genes,fill=Date))+geom_bar(stat
 
 ```
 
-## Retrieving IDs, Mapping of ENSG
+### Retrieving IDs, Mapping of ENSG
 Sequences are remapped to Genes. Data is loaded from Uniprot and BioMart. Please note, that Uniprot cannot be used atm due to updated web services, which caused the Uniprot.ws package to not work anymore. Since all previous information was saved, new entries will for now only be mapped by using BioMart.
 ```{r ID Mapping, message=FALSE, warning=FALSE,fig.cap="Sequence counts with missing IDs"}
 
 library(biomaRt)
 (lapply(TableListNorm,function(x){table(x$InputTable$SearchSpecificity)}))
   if(!file.exists("./Experiments/TableListNormEns_v2.rda")|rerun){
-    
-    
-    # Gene Names
-    # Gene Names
     
     load("./Experiments/Uniprot.ws_Infos.rda")
     PGs <- lapply(TableListNorm,function(x){
@@ -927,314 +974,13 @@ EnsgObtain[ensembl_gene_id=="",c("hgnc_symbol","ensembl_gene_id","UniprotAccessi
        UniprotAccession=paste(sort(unique(tempMatch$Ori)),collapse=";")
        )
 },OriginalID]
+
 EnsgObtain$ensembl_gene_id[EnsgObtain$ensembl_gene_id==""] <- EnsgObtain$OriginalID[EnsgObtain$ensembl_gene_id==""]
-EnsgObtain[ensembl_gene_id==""]
-
-
-    
-    
-    # missing <- setdiff(PGsuni,EnsgObtain$)
-    # EnsgObtain <- PGsuniENSG 
-    # table(EnsgObtain$ensembl_gene_id=="")
-    # table(EnsgObtain$ensembl_gene_id=="unknown")
-    # missing <- EnsgObtain[ensembl_gene_id==""]$OriginalID
-    # MissingFun <- RetrieveENSGfromUni(missing)
-
-    # Missing <- EnsgObtain[EnsgObtain$ensembl_gene_id=="",]
-    # Missing$UniprotAccession
-    # MissingFUN <- RetrieveENSGfromUni(Missing$UniprotAccession)
-    # EnsgObtain <- rbind(EnsgObtain,MissingFUN)
-    # 
-    +# mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
-    # Missing <- EnsgObtain[EnsgObtain$ensembl_gene_id=="",]
-    # ENSG_Missing <- RetrieveENSGfromUni(missing)
-    
-    # grep("Q9P206",PGsuni,value=T)
-    # MissingIDS <- unlist(strsplit(Missing$UniprotAccession,";"))
-    # MissingIDS <- unique(MissingIDS)
-    # MissingIDS <- gsub("_.*.|-.*.","",MissingIDS)
-    # MissingIDS <- unique(MissingIDS)
-    # write(MissingIDS,"MissingIDS.txt")
-    # humpe <- lapply(TableListNorm,function(x){
-    #   x$InputTable$Proteins
-    # })
-    # save(humpe,file="MissingIDs.rda")
-if(0){
-   lu <- lapply(TableListNorm,function(x){
-    
-      ID <- x$InputTable$Proteins
-
-    ID <- gsub("-[123456789]","",ID)
-    IDuni <- strsplit(ID,";")
-    IDuni <- unlist(IDuni)
-    IDuni <- unique(IDuni)
-    IDuniAll <- IDuni
-    IDuni <- gsub("_.*.","",IDuni)
-    IDuni <- unique(IDuni)})
-    IDs <- unique(unlist(lu))
-    
-
-    Se <- lapply(TableListNorm,function(x){ID <- x$InputTable$Sequence
-    
-    ID <- gsub("-[123456789]","",ID)
-    IDuni <- strsplit(ID,";")
-    IDuni <- unlist(IDuni)
-    IDuni <- unique(IDuni)
-    IDuniAll <- IDuni
-    IDuni <- gsub("_.*.","",IDuni)
-    IDuni <- unique(IDuni)})
-    Se <- unique(unlist(Se))
-    
-    IDsMissing <- IDs[is.na(match(IDs,UniRes2$UNIPROTKB))]
-    
-    # cufu <- cut(1:length(IDs),breaks = 10)
-    # EnsembelRes <- lapply(unique(cufu),function(x){
-    #   print(x)
-    #   x <<- x
-    #   getBM(filters= "ENS", attributes= c("uniprotswissprot","ensembl_gene_id",
-    #                                                    "hgnc_symbol",
-    #                                                    "description"),values=IDs[x==cufu],mart= mart)
-    # })
-    
-    # EnsemblRes <- rbindlist(EnsembelRes)
-    # Mapping Missing IDs
-    MissingIds_ENS <- getBM(filters= "uniprotsptrembl", attributes= c("uniprotsptrembl","ensembl_gene_id",
-                                                     "hgnc_symbol",
-                                                     "description"),values=IDsMissing,mart= mart)
-     
-    # MissingIds_ENS <- getBM(filters= "uniprotswissprot", attributes= c("uniprotswissprot","ensembl_gene_id",
-    #                                                  "hgnc_symbol",
-    #  
-     df <- data.frame(matrix(ncol = length(names(UniRes2)), nrow = dim(MissingIds_ENS)[1]))
-    names(df) <- names(UniRes2)
-    
-    df$UNIPROTKB <- MissingIds_ENS$uniprotsptrembl
-    df$GENES <- MissingIds_ENS$hgnc_symbol
-    df$FUNCTION <- MissingIds_ENS$description
-    df$ENSEMBL <- MissingIds_ENS$ensembl_gene_id
-    UniRes2 <- rbind(UniRes2,df)
-    
-    UniEnsemble <- unique(unlist(strsplit(UniRes2$ENSEMBL,";")))
-    G_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id",
-                                                              "hgnc_symbol","ensembl_peptide_id",
-                                                              "description"),values=UniRes2$ENSEMBL,mart= mart)
-
-    # Compiling EnsembleData
-    cl <- makeCluster(threads)
-    clusterExport(cl,"G_list")
-    CombiFun <- parSapply(cl,strsplit(unique(UniRes2$ENSEMBL),";"),function(x){
-      x <- x
-      # cat("\r",x)
-      G_ListUni <- G_list[!is.na(match(G_list$ensembl_gene_id,x)),]
-      tempx <- apply(G_ListUni,2,function(x){paste(sort(unique(x)),collapse=";")})
-      tempx
-      
-    })
-    stopCluster(cl)
-    CombiFun <- t(CombiFun)
-    CombiFun <- data.table(CombiFun)
-    UniRes2 <-cbind(UniRes2,CombiFun[match(UniRes2$ENSEMBL,unique(UniRes2$ENSEMBL)),])
-    UniRes2$ENSEMBL[is.na(UniRes2$ENSEMBL)] <- ""
-    table(UniRes2$ENSEMBL=="")
-    MissingIDS <- UniRes2[UniRes2$ENSEMBL=="",]
-    MissingIDS$UNIPROTKB
-    RemainingInfo <- getBM(filters= "uniprotswissprot", attributes= c("uniprotswissprot","ensembl_gene_id",
-                                                     "hgnc_symbol",
-                                                     "description"),values=MissingIDS$UNIPROTKB,mart= mart)
-    RemainingInfo2 <- getBM(filters= "uniprotsptrembl", attributes= c("uniprotsptrembl","ensembl_gene_id",
-                                                     "hgnc_symbol",
-                                                     "description"),values=MissingIDS$UNIPROTKB,mart= mart)
-    
-    UniRes2$ENSEMBL[match(RemainingInfo$uniprotswissprot,UniRes2$UNIPROTKB)] <- RemainingInfo$ensembl_gene_id
-    UniRes2$hgnc_symbol[match(RemainingInfo$uniprotswissprot,UniRes2$UNIPROTKB)] <- RemainingInfo$hgnc_symbol
-    UniRes2[match(RemainingInfo$uniprotswissprot,UniRes2$UNIPROTKB),]
-    
-    UniMissingGenes <- unlist(strsplit(MissingIDS$GENES,";| "))
-    UniMissingGenes <- UniMissingGenes[!is.na(UniMissingGenes)]
-    UniMissingGenes <- UniMissingGenes[UniMissingGenes!=""]
-
-    RemainingInfo3 <- getBM(filters= "external_gene_name", attributes= c("uniprotsptrembl","ensembl_gene_id",
-                                                     "hgnc_symbol","external_gene_name",
-                                                     "description"),values=UniMissingGenes,mart= mart)
-    
-    
-    # getBM(filters= c("uniprotswissprot","uniprotsptrembl","external_gene_name"), attributes= c("uniprotswissprot","uniprotsptrembl","external_gene_name","ensembl_gene_id",
-    #                                                  "hgnc_symbol",
-    #                                                  "description"),values=list(uniprotswissprot=MissingIDS$UNIPROTKB,uniprotsptrembl=MissingIDS$UNIPROTKB,external_gene_name=unique(unlist(strsplit(MissingIDS$UNIPROTKB," ",fixed=T)))),mart= mart)
-    
-    MissingIDsFun <- lapply(strsplit(MissingIDS$GENES,";| "),function(xg){
-      xg <<- xg
-      xgmatch <- !is.na(match(RemainingInfo3$external_gene_name,xg))
-      if(any(xgmatch)){
-        xg_match_ta <- RemainingInfo3[xgmatch,]
-        xg_match_ta <- apply(xg_match_ta,2,function(x){
-          paste(unique(x),collapse=";")
-        })
-        xg_match_ta <- as.list(xg_match_ta)
-      }else{
-        xg_match_ta <- rep(NA,dim(RemainingInfo3)[2])
-        names(xg_match_ta) <- colnames(RemainingInfo3)
-        xg_match_ta <- as.list(xg_match_ta)
-      }
-      xg_match_ta
-    })
-    MissingIDsFunDa <- rbindlist(MissingIDsFun)
-    
-    MissingIDS$ensembl_gene_id <- MissingIDsFunDa$ensembl_gene_id
-    MissingIDS$hgnc_symbol <- MissingIDsFunDa$hgnc_symbol
-    MissingIDSSuccess <- MissingIDS[!is.na(MissingIDS$ensembl_gene_id),]
-    
-    UniRes2$ENSEMBL[match(MissingIDSSuccess$UNIPROTKB,UniRes2$UNIPROTKB)] <- MissingIDSSuccess$ensembl_gene_id
-    UniRes2$hgnc_symbol[match(MissingIDSSuccess$UNIPROTKB,UniRes2$UNIPROTKB)] <- MissingIDSSuccess$hgnc_symbol
-    # UniRes2[match(MissingIDSSuccess$UNIPROTKB,UniRes2$UNIPROTKB),] 
-    missing <- UniRes2[grep("ENSG",UniRes2$ENSEMBL,invert=T),]
-    
-    grep("gene",listAttributes(mart)[,1],value=T)
-    RemainingInfo4 <- getBM(filters= c("ensembl_gene_id"), attributes= c("uniprotsptrembl","ensembl_gene_id",
-                                                     "hgnc_symbol","external_gene_name",
-                                                     "description"),values=missing$GENEID,mart= mart)
-
-    paste(missing$UNIPROTKB,collapse=" ")
-    # missing <- setdiff(IDs,EnsemblRes$uniprotswissprot)
-    # 
-    # G_list <- getBM(filters= "uniprotswissprot", attributes= c("uniprotswissprot","ensembl_gene_id",
-    #                                                            "hgnc_symbol",
-    #                                                            "description"),values=IDs,mart= mart)
-    if(0){
-      # 20220712 sevice not working at the moment, likely due to updated Uniprot Services...
-      UniRes <- select(up,IDsMissing,keytype = "UNIPROTKB",columns = c("GENES","UNIPROTKB","COMMENTS","SUBCELLULAR-LOCATIONS","FEATURES","FUNCTION","GENEID","FAMILIES","ENSEMBL","ENSEMBL_PROTEIN"))
-      UniRes2 <- rbind(UniRes,UniRes2)
-    }
-   
-    
-    UniRes2 <- unique(UniRes2)
-    # save(UniRes2,file="Uniprot.ws_Infos.rda")"description"),values=IDsMissing,mart= mart)
-        TableListNormEns <- lapply(TableListNorm,function(x){
-      x <- x
-      cat("\rUniprot Mapping",x$xname)
-      # 
-      ID <- x$InputTable$Proteins
-      
-      print("Starting Cluster")
-      cl <- makeCluster(threads)
-      try({
-        
-        idsplit <<- strsplit(unique(ID),";")
-        print("ClusterExport")
-        clusterExport(cl,list("UniRes2","idsplit"))
-        print("Compiling Uniprot Data")
-        BindFun <- parLapply(cl,1:length(idsplit),function(y){
-          library(data.table)
-          # cat("\r",y,length(idsplit))
-          y <- unique(idsplit[[y]])#gsub("-.*","",idsplit[[x]])
-          y <- unique(gsub("_.*.|-.*.","",y))
-          f <- which(!is.na(match(gsub("_.*.|-.*.","",UniRes2$UNIPROTKB),y)))
-          extra <- UniRes2[f,]
-          extra$GENES <- gsub(" ",";",extra$GENES)
-          extra$GENEID <- gsub(" ","",extra$GENEID)
-          extra <- apply(extra,2,function(x){x <- unique(x);x <- gsub("  "," ",x);paste(x,collapse=";")})
-          dt <- t(matrix(extra))
-          colnames(dt) <- names(extra)
-          data.table(dt)
-        })
-      })
-      stopCluster(cl)
-      
-      # BindFun <- lapply(BindFun,as.data.table)
-      InfoTable <- rbindlist(BindFun)
-      
-      #' adding Splicing information:
-      # SpliceCat <- unique(Splicing$IsoformType)
-      if(0){
-        Splicing <- fread("/Users/henno/Documents/Skripte/R-Functions/Selbach-Functions/DataAnalysis/20210129_AK_ProteinIsoforms/Experiments/ALternativeSplicingDatabase/PROT_ISOFORMS-hg38.tab",sep = "\t")
-        ensP <- strsplit(InfoTable$ENSEMBL_PROTEIN,";")
-        SpliceCat <- c("Excl_main","Excl_other","Incl_main","Incl_other","EventIDcount")
-        
-        cl <- makeCluster(threads,setup_strategy = "sequential")
-        print("Compiling Splicing Information")
-        SPLICINFO <- parSapply(cl,1:length(ensP),function(x,ensP,Splicing,SpliceCat){
-          library(data.table)
-          x <- x
-          # cat("\r",x,length(ensP))
-          x <- ensP[[x]]
-          SplicDB <- !is.na(match(Splicing$IsoformID,x))
-          if(any(SplicDB)){
-            SplicDB <- Splicing[SplicDB]
-            fu <- table(SplicDB$IsoformType)
-            fu$EventIDcount <- length(unique(SplicDB$EventID))
-            fu <- unlist(fu)
-            fu <- fu[match(SpliceCat,names(fu))]
-          }else{
-            fu <- rep(as.double(NA),5)
-          }
-          fu <- unlist(fu)
-          c(fu,sum(fu[1:4],na.rm = T))
-          
-        },ensP,Splicing,SpliceCat)
-        stopCluster(cl)
-        
-        SPLICINFO <- t(SPLICINFO)
-        colnames(SPLICINFO) <- c(SpliceCat,"AllSplice")
-        SPLICINFO[is.na(SPLICINFO)] <- 0
-        InfoTable <- cbind(InfoTable,SPLICINFO)
-        SplicDB <- match(InfoTable$ENSEMBL_PROTEIN,Splicing$IsoformID)
-        InfoTable_matched <- InfoTable[match(ID,unique(ID)),]
-      }else{
-        
-        InfoTable_matched <- InfoTable[match(ID,unique(ID))]
-      }
-      
-      print("Compiling gn_dt")
-      
-      ens <- InfoTable_matched$ENSEMBL
-      gn <- InfoTable_matched$GENES
-      while(any(grepl(";;",gn))){
-        gn <- gsub(";;",";",gn)
-      }
-      while(any(grepl("  ",gn))){
-        gn <- gsub("  "," ",gn)
-      }
-      gnuni <- unique(gn)
-      gn2 <- sapply(strsplit(gnuni,";"),function(x){paste(unique(x),collapse=";")})
-      gn2 <- gsub("^;","",gn2)
-      gn2 <- gsub(";$","",gn2)
-      gn3 <- gn2[match(gn,gnuni)]
-      gn3[gn3=="NA"] <- NA
-      # grep("P55011",UniRes$UNIPROTKB,value = T)
-      dt_gn <- data.table(gn=gn3,ens=InfoTable_matched$ENSEMBL,UniAccession=x$InputTable$`Leading razor protein`,hgnc_symbol=InfoTable_matched$hgnc_symbol,seq=x$InputTable$Sequence)
-      # dt_gn[,GN_ENS:= {
-      #   temp <- .SD
-      #   # cat("\r",.GRP)
-      #   # gn <- gn
-      #   gn <- unique(gn)
-      #   gn <- gn[!is.na(gn)]
-      #   if(length(gn)==0){
-      #     gn <- unique(ens)
-      #   }
-      #   if(is.na(gn)){
-      #     gn <- (UniAccession)
-      #   }else{
-      #     paste(unique(gn),collapse=";")
-      #   }
-      # },ens]
-      dt_gn$ens[dt_gn$ens==""] <- dt_gn$UniAccession[dt_gn$ens==""]
-      table(is.na(dt_gn$ens))
-      
-      x$dt_gn <-dt_gn
-      x
-    })
-
-}
-
-   
-    save(EnsgObtain,file="EnsgObtain.rda")
+save(EnsgObtain,file="EnsgObtain.rda") # entries with missing information
     
     TableListNormEns <- lapply(TableListNorm,function(x){
-      x <<- x
       x$InputTable$Reverse
-      # stop()
       cat("\rUniprot Mapping",x$xname)
-      # 
       ID <- x$InputTable$Proteins
       M1 <- match(ID,EnsgObtain$OriginalID)
       EnsgObtainMapped <- EnsgObtain[M1,]
@@ -1255,9 +1001,6 @@ if(0){
     })
     lapply(TableListNormEns,function(x){table(x$InputTable$SearchSpecificity)})
     save(TableListNormEns,file="./Experiments/TableListNormEns_v2.rda")
-    
-    # table(grepl("ENSG",TableListNormEns$`txt_2020_12_23_TMTpro_8per_MBR/peptides.txt`$dt_gn$ens))
-    
   }else{
     if(!exists("TableListNormEns")){
           load("./Experiments/TableListNormEns_v2.rda")
@@ -1266,14 +1009,12 @@ if(0){
 
   }
 
-length(TableListNormEns)
 
 IDmappingList <- lapply(TableListNormEns,function(x){
   temp <- x$dt_gn
   x$xname <- gsub("peptides.txt","",x$xname)
   temp$seq <- NULL
   temp$GN_ENS <- NULL
-  # temp <- temp[,unique(.SD),UniAccession]
   countfun <- function(x,invert=F){
     # x <- unique(x)
         xtemp <- (is.na(x)|x=="")
@@ -1297,8 +1038,6 @@ IDmappingList <- lapply(TableListNormEns,function(x){
   sumi <- data.table(sumi)
   sumi$gel <- x$xname
   # multiple IDs
-  # tempUni <- unique(temp)
-  
   MultipleTemp <- temp[grep(";",ens),]
   MultipleMaps<- data.table(Sequences_ENSG=length(grep(";",temp$ens)),Sequences_hgnc=length(grep(";",temp$hgnc_symbol)),
              ENSG_unique=length(grep(";",unique(temp$ens))),hgnc_unique=length(grep(";",unique(temp$hgnc_symbol))))
@@ -1330,7 +1069,7 @@ print("MultiMapping in Percent:")
 Multimapping$Sequences_ENSG/Multimapping$Total_Seqs
 
 ```
-## Normalization results for single selected Genes
+### Normalization results for single selected Genes
 ```{r fig.height=4,figures-side, fig.show="hold", out.width="50%", message=FALSE, warning=FALSE,fig.cap = "Traces from Selected Genes. Compared are scaled Raw Traces vs. TMT-batch and Zero Neighbour corrected traces."}
 library(gridExtra)
    geneList <- list(ENSG00000026025="VIM",ENSG00000076201="PTPN23",ENSG00000120802="TMPO",ENSG00000109320="nfkb1",ENSG00000167193="crk",ENSG00000172216="cebpb")
@@ -1352,24 +1091,18 @@ library(gridExtra)
       })
          TMTSubset_final <- t(TMTSubset_final)
         TMTSubset_final <- data.table(TMTSubset_final)
-        # TMTSubset_final_singlenorm <- x$TMTSubset_final_singlenorm
-        # TMTSubset_final_singlenorm_MSCALE <- x$TMTSubset_final_singlenorm_Mscale
+       
         TMTSubset_final_singlenorm_zscore <- x$TMTSubset_final_singlenorm_zscore
         
         g1 <- Gpplot_LineTraces(TMTSubset_final[sel,],"Raw zscored",applyscale=F,smoothtable = F)
-        # g2 <- Gpplot_LineTraces(TMTSubset_final_singlenorm[sel,],"Singlenorm",applyscale=F)
-        # g3 <- Gpplot_LineTraces(TMTSubset_final_singlenorm_MSCALE[sel,],"Singlenorm MScale",applyscale = F)
+        
         g4 <- Gpplot_LineTraces(TMTSubset_final_singlenorm_zscore[sel,],"Singlenorm Zscore",applyscale = F)
-        # g5 <- Gpplot_LineTraces(TMTSubset_final_singlenorm_MSCALE[sel,],"Singlenorm MScale",applyscale = F,smoothtable = T)
-        # g6 <- Gpplot_LineTraces(TMTSubset_final_singlenorm_zscore[sel,],"Singlenorm MScale",applyscale = F,smoothtable = T)  
+       
         grid.arrange(
            g1+ggtitle(paste(dirname(x$xname),ge,sep = "\n"))+xlab("Fractions")+ylab("Raw")+theme(plot.title=element_text(size=8),legend.key.width = unit(0.2, 'cm'),legend.title = element_text(size=10),legend.text = element_text(size=6)),
-           # g2+ggtitle(paste(dirname(x$xname),ge,sep = "\n"))+xlab("Fractions")+ylab("ChannelCorrected")+theme(plot.title=element_text(size=8),legend.key.width = unit(0.2, 'cm'),legend.title = element_text(size=10),legend.text = element_text(size=6)),
+          
           g4+ggtitle(paste(dirname(x$xname),ge,sep = "\n"))+xlab("Fractions")+ylab("zscored")+theme(plot.title=element_text(size=8),legend.key.width = unit(0.2, 'cm'),legend.title = element_text(size=10),legend.text = element_text(size=6)),ncol=2
         )
-       
-        # plot(g5+ggtitle(paste(dirname(x$xname),ge,sep = "\n"))+xlab("Fractions")+ylab("MScale"))
-        # plot(g6+ggtitle(paste(dirname(x$xname),ge,sep = "\n"))+xlab("Fractions")+ylab("zscored"))
                     
       })
       
@@ -1377,13 +1110,12 @@ library(gridExtra)
   
 ```
 
-## Improving Gene Unit Assigment
+### Improving Gene Unit Assigment
 -   SNP Variants can cause splits of gene specific peptide groups
 -   Gene Symbol will be used for consolidation
-
+```{r}
 ## Defining Unique Assignments based on Gene Symbols
 
-```{r}
 if(length(TableListNormEns)==4){
   TableListNormEns<- TableListNormEns[-1]
 
@@ -1471,15 +1203,20 @@ TableListNormEns <- lapply(TableListNormEns,function(x){
 ```
 
 
-## Gene centric Peptide Clustering using hdbscan
-- RPackage dbscan
-- provides clustering scores
-- cluster Zero is the noise cluster
-- Settings:
-  - minPts: "not only acts as a minimum cluster size to detect, but also as a "smoothing" factor of the density estimates implicitly computed from HDBSCAN."
-  - two consequtive runs with minPts set to 2 and 3
-- decoy dataset generated and clustered
-  - n random peptides are picked from the remaining table 
+### Gene-centric clustering (HDBSCAN) — purpose and rationale
+
+Goal: identify consistent groups of co-eluting peptides that represent candidate **proteoform** peaks while minimizing false positives arising from single-peptide events.
+
+Why HDBSCAN?
+- It is density-based and does not require specifying the number of clusters.
+- It explicitly labels noise points (cluster 0), which removes inconsistent single-peptide traces from automatic peak calls.
+- We run HDBSCAN with multiple `minPts` settings and select the clustering with the best silhouette score per gene (multi-round refinement is applied to overly large clusters).
+
+Practical consequences:
+- Single-fraction / single-peptide events are treated as noise and set aside for manual inspection.
+- Overlapping peptide subsets across gels can yield redundant clusters; these are merged later based on fraction centroid and predicted MW (see Peak Merging).
+- The pipeline therefore favors specificity (fewer false positives) at the cost of leaving low-confidence events for expert review.
+
 
 ```{r hdbscan, fig.height=4, fig.width=12, message=FALSE, warning=FALSE}
   if(!file.exists("./Experiments/TableListNormEnsHdbScan_v5_wo_semitryptic.rda")|rerun){
@@ -1490,10 +1227,7 @@ TableListNormEns <- lapply(TableListNormEns,function(x){
     stopCluster(cl)
     cl <- makeCluster(length(TableListNormEns),outfile="")
     clusterExport(cl,c("hdbwrapper_low","RerunHighClusters","removenoisetable_hdbscan"))
-    # # TableListNormEnsHdbScan <- parLapply(cl,TableListNormEns,ApplyHdbscanIsofrac_v2)
-    # table(TableListNormEnsHdbScan$`txt_2021_01_30_TMTpro_5er_MBR/peptides.txt`$hdbscanTables$cl_2)
-    # table(TableListNormEnsHdbScan$`txt_2021_01_30_TMTpro_5er_MBR/peptides.txt`$hdbscanTables$cl_2_nf)
-    # table(TableListNormEnsHdbScan$`txt_2020_12_23_TMTpro_8per_MBR/peptides.txt`$hdb$cl_2)
+   
     TableListNormEnsHdbScan <- parLapply(cl,TableListNormEns,ApplyHdbscanIsofrac_v2,randomize=F)
     # double checking performance on complicated TNS1 Protein
     table(TableListNormEnsHdbScan[[1]]$hdbscanTables[EnsG=="ENSG00000079308"]$clusterUsed)
@@ -1502,10 +1236,6 @@ TableListNormEns <- lapply(TableListNormEns,function(x){
     table(TableListNormEnsHdbScan[[2]]$hdbscanTables[EnsG=="ENSG00000079308"]$cl_2)
     table(TableListNormEnsHdbScan[[3]]$hdbscanTables[EnsG=="ENSG00000079308"]$clusterUsed)
     table(TableListNormEnsHdbScan[[3]]$hdbscanTables[EnsG=="ENSG00000079308"]$cl_2)
-
-    # table(TableListNormEnsHdbScan[[4]]$hdbscanTables[EnsG=="ENSG00000079308"]$clusterUsed)
-    # table(TableListNormEnsHdbScan[[4]]$hdbscanTables[EnsG=="ENSG00000079308"]$cl_3)
-    # table(TableListNormEnsHdbScan[[4]]$hdbscanTables_random[EnsG=="ENSG00000079308"]$cl_3)
 
     
     TableListNormEnsHdbScan <- parLapply(cl,TableListNormEnsHdbScan,ApplyHdbscanIsofrac_v2,randomize=T)
@@ -1560,7 +1290,6 @@ TableListNormEns <- lapply(TableListNormEns,function(x){
     lapply(TableListNormEnsHdbScan,function(x){table(x$hdbscanTables$cl_2_nf)})
 
     save(TableListNormEnsHdbScan,file="./Experiments/TableListNormEnsHdbScan_v5_wo_semitryptic.rda")
-    # TableListNormEnsHdbScan[[2]]$hdbscanTables[EnsG=="ENSG00000079308"]$cl_2_nf
 
   }else{
     print("Loading TableListNormEnsHdbScan_v5_wo_semitryptic.rda")
@@ -1571,7 +1300,6 @@ TableListNormEns <- lapply(TableListNormEns,function(x){
   }
 
 barplot(table(TableListNormEnsHdbScan[[3]]$hdbscanTables[cl_2!=0,length(unique(Seq)),.(cl_2,EnsG)]$V1))
-  # TableListNormEnsHdbScan$`txt_2020_12_23_TMTpro_8per_MBR/peptides.txt`$hdbscanTables[EnsG=="ENSG00000167193"]
     checkClusters <- lapply(TableListNormEnsHdbScan,function(x){
       xtemp <<- x$hdbscanTables
       xtemp2 <<- x$hdbscanTables_random
@@ -1615,309 +1343,351 @@ ggplot(Ratio3[n<20,],aes(n,log10(V1),fill=gel))+geom_point()+ylab("log10 n(fw)/n
 ```
 
 
-## Fractions to MW models
-- Predicts average mw in fraction based on first Uniprot Entry listed for each identified peptide.
+## Fraction-to-Molecular Weight (MW) Modeling
 
-- Using Loess
+-	Predicts the average molecular weight per gel fraction based on the first UniProt entry assigned to each identified peptide.
+-	Uses LOESS regression to model the relationship between fraction number and molecular weight.
+
 ```{r MW_Fraction_loess_Model, message=FALSE, warning=FALSE}
 library(Peptides)
-  #############################
-  # Predict MW-Fraction model 
-  
-rerun <- T
-  if(!file.exists("./Experiments/TableListNormEnsHdbScan_v4.rda")|rerun){
-    
-   graphics.off()
-pdf("./Experiments/ISOFRAC_Gels_MW_Mapping.pdf")
 
-library(parallel)
-se <- rbindlist(unique(lapply(TableListNormEnsHdbScan,function(input){input$dt_gn$seq <- input$InputTable$Sequence;input$dt_gn})))
-# TableListNormEnsHdbScan <- lapply(TableListNormEnsHdbScan,function(input){input$dt_gn$seq <- input$InputTable$Sequence; input})
-# library(parallel)
-if(!file.exists("./Experiments/FunResultsdt.rda")|rerun){
-  if(!exists("FunResultsdt")){
-    lo <- load("./Experiments/ProteinSequences_UPproteolytic_PacBio.rda")
-    
-    cl <- makeCluster(7)
-    clusterExport(cl,list("se","UniSequences_all"))
-    FunResults<- parLapply(cl, unique(se$ens),function(x){
-      library(data.table)
-      seq  <- se[se$ens==x,]
-      tempfun <-  UniSequences_all[ENSG==x,]
-      if(dim(tempfun)[1]==1){
-        OutMW <- as.character(tempfun$MW)
-      }else{
-        OutMW <- sapply(seq$seq,function(x){paste(unique(tempfun$MW[grep(x,tempfun$SEQUENCE,fixed = T)]),collapse=";")})
-      }
-      if(length(OutMW)==0){
-        OutMW <- "NOTAVAILABLE"
-      }
-      data.table(mw=OutMW,ens=x,seq=seq$seq)
-    })
-    FunResultsdt <- rbindlist(FunResults)
-    FunResultsdt <- unique(FunResultsdt)
-    stopCluster(cl)
-    rm("cl")
-  }
-  save(FunResultsdt,file="./Experiments/FunResultsdt.rda") 
-}else{
-  if(!exists("FunResultsdt")){
-    lo <- load("./Experiments/FunResultsdt.rda")
-    
-  }
-}
+#############################
+# Predict MW-Fraction model
 
-if(!exists("UniAcc")){
-  load("./Experiments/ACC_Sequences.rda")
-  
-}
+rerun <- TRUE
 
-UniAcc <- data.table(UniAcc)
-library(Peptides)
+if (!file.exists("./Experiments/TableListNormEnsHdbScan_v4.rda") | rerun) {
+  graphics.off()
+  pdf("./Experiments/ISOFRAC_Gels_MW_Mapping.pdf")
 
+  library(parallel)
 
-UniAcc[,MW:={
-  
-  se <- as.double(NA)
-  SEQ <- gsub("U","Y",.BY$SEQUENCE)
-  SEQ <- gsub("X","D",SEQ)
-  (se <- mw(SEQ,monoisotopic = T))
-  se
-},SEQUENCE]
+  se <- rbindlist(unique(lapply(TableListNormEnsHdbScan, function(input) {
+    input$dt_gn$seq <- input$InputTable$Sequence
+    input$dt_gn
+  })))
 
-TableListNormEnsHdbScanMW <- lapply(1:length(TableListNormEnsHdbScan),function(itx){
-  
-  print(itx)
-  
-  library(pracma)
-  input <- TableListNormEnsHdbScan[[itx]]
-  
-  peptides <- input$InputTable$Sequence
-  mapData  <- input$TMTSubset_final_singlenorm_zscore
-  print(paste("Starting",input$xname))
-  # Mapping mw of proteins
-  splitfun <- strsplit(input$dt_gn$UniAccession,";")
-  ACC_stripped <- sapply(splitfun,function(x){x[1]})
-  # ACC_stripped <- gsub("-.$","",sapply(strsplit(input$dt_gn$UniAccession,";"),"[[",1))
-  ACC_stripped <- gsub("-..$","",ACC_stripped)
-  acc <- unique(ACC_stripped)
-  
-  
-  UniAccM <- UniAcc[match(ACC_stripped,UNIPROTKB)]
-  
-  # hist(nchar(UniAccM$SEQUENCE))
-  
-  input$Protein_MW <- UniAccM
-  
-  #########
-  
-  mapData$MW <- input$Protein_MW$MW
-  mapData$Sequence <- peptides
-  # table(Sel)
-  # Filter For
-  Sel <- sapply(strsplit(input$InputTable$Proteins,";"),function(x){
-    length(unique(gsub("_.*.","",x)))
-  })
-  SelSum <- table(Sel)
-  SelSumSel <- SelSum[SelSum>500]# minimize number of multiple Mapping Proteins
-  
-  sel <- Sel==names(SelSumSel[names(SelSumSel)==min(names(SelSumSel))])#input$InputTable$`Unique (Proteins)`=="yes"
-  
-  dt_gn_spec <- input$dt_gn[sel,]
-  # FunResultsdt[match(dt_gn_spec$seq,FunResultsdt$seq)]
-  mapDataSpec <- mapData[sel,]
-  print("Starting ENSP Mapping")
-  ENSPMW <- FunResultsdt[match(dt_gn_spec$seq,FunResultsdt$seq)]
-  
-  options(warn=-1)
-  MeltDataSpecific <- mapData[sel,{
-    # cat("\r",.GRP)
-    temp <- .SD
-    temp <- unlist(temp)[1:28]
-    sel <- temp==max(temp,na.rm = T)
-    sel[is.na(sel)]<- F
-    sel[is.infinite(sel)]<- F
+ 
+  # library(parallel)
+  if (!file.exists("./Experiments/FunResultsdt.rda") | rerun) {
+    if (!exists("FunResultsdt")) {
+      lo <- load("./Experiments/ProteinSequences_UPproteolytic_PacBio.rda")
 
-    # if(any(is.))
-    which(sel)
-    
-    
-  },.(Sequence)]
-  options(warn=1)
+      cl <- makeCluster(7)
+      clusterExport(cl, list("se", "UniSequences_all"))
 
-  table(MeltDataSpecific$V1)
-  
-  MeltDataSpecific$MW_ENSP <- ENSPMW[match(MeltDataSpecific$Sequence,ENSPMW$seq),]$mw
-  
-  ggplot(MeltDataSpecific,aes(jitter(V1),log10(as.numeric(MW_ENSP))))+geom_bin2d(bins=100)
-  
-  
-ggplot(data = MeltDataSpecific, aes(V1, log10(as.numeric(MW_ENSP)))) +   stat_density2d(aes(fill = ..density..^0.5), geom = "tile", contour = FALSE, n = 300) +   scale_fill_continuous(low = "white", high = "darkblue")+theme(legend.position = "none")
+      FunResults <- parLapply(cl, unique(se$ens), function(x) {
+        library(data.table)
 
-  smoothScatter(MeltDataSpecific$V1,log10(as.numeric(MeltDataSpecific$MW_ENSP)),axes=T,ylab="mw Da",xlab="fraction",main=input$xname,ylim=c(3,6))
-  mtext("All")
-  
-  mwt <- sapply(seq(1,20,by=0.5),function(x){10^x})
-  axis(2,at=log10(mwt),labels = paste(round(mwt/1000),"kD"))
-  axis(1)
-  LAFU <- lapply(1:50,function(i){
-    # cat("\r",i)
-    MW_density <- MeltDataSpecific[,{
-      MW_temp <- .SD
-      temp_d<- density(log2(sample(as.numeric(MW_temp$MW_ENSP),replace = T)),bw=0.1,na.rm = T)
-      # plot(temp_d)
-      
-      fi_p <- findpeaks(temp_d$y)
-      mw_sel <- fi_p[fi_p[,1]==max(fi_p[,1]),]
-      wi <- 0.2
-      qs <- quantile(temp_d$x[temp_d$x>=(temp_d$x[mw_sel[2]]-wi)&temp_d$x<=(temp_d$x[mw_sel[2]]+wi)],probs = c(0.1,0.9))
-      # plot(temp_d)
-      # abline(v=temp_d$x[mw_sel[2]])
-      list(m=2^temp_d$x[mw_sel[2]],q1=2^qs[1],q2=2^qs[2])
-      
-    },.(fraction=V1)]
-    
-    
-    lmMod <- lm(log10(MW_density$m)~MW_density$fraction)
-    # lmModlo <- lm(log10(MW_density$q1)~MW_density$fraction)
-    # lmModhi <- lm(log10(MW_density$q2)~MW_density$fraction)
-    # 
-    sel <- abs(lmMod$residuals)>0.5
-    
-    abline(coefficients(lmMod),col = 2,lwd = "dotted")
-    lo2 <- loess(log10(MW_density$m)[!sel]~MW_density$fraction[!sel],span = 0.5,surface = "direct" )
-    lo2_lo <- loess(log10(MW_density$q1)[!sel]~MW_density$fraction[!sel],span = 0.5,surface = "direct" )
-    lo2_hi <- loess(log10(MW_density$q2)[!sel]~MW_density$fraction[!sel],span = 0.5,surface = "direct" )
-    
-    points(lo2$x[order(lo2$x)],lo2$fitted[order(lo2$x)],type="l",col = "red",alpha=0.5,lwd=3)
-    points(lo2_lo$x[order(lo2_lo$x)],lo2_lo$fitted[order(lo2_lo$x)],type="l",col = "lightgreen",alpha=0.5,lwd = "dotted")
-    points(lo2_hi$x[order(lo2_hi$x)],lo2_hi$fitted[order(lo2_hi$x)],type="l",col = "lightgreen",alpha=0.5,lwd = "dotted")
-    
-    qs <- quantile(lo2$fitted[order(lo2$x)],na.rm = T)
-    axis(4,at=qs,labels = paste(round((10^qs)/1000),"kD"),4,las=2,cex=0.5)
-    abline(h=qs,lty=c(3,2,1,2,3)) 
-    
-    list(md=lo2,md_lo=lo2_lo,md_hi=lo2_hi,MW_density=MW_density,lmMod=lmMod$residuals)
-  })
-  
-  
-  
-  rb <- rbindlist(lapply(LAFU,function(x){
-    x <<- x
-    sel <- abs(x$lmMod)<0.5
-    # plot(x$MW_density$fraction,x$lmMod)
-    x$MW_density[sel]
-  }))
-  rb <- rb[order(rb$fraction)]
-  
-  smoothScatter(MeltDataSpecific$V1,log10(as.numeric(MeltDataSpecific$MW_ENSP)),axes=T,ylab="mw Da",xlab="fraction",main=paste(gsub("/.*.","",input$xname),"Step 2 Loess on average Bootstrapping points",sep = "\n"))
-  points(rb$fraction,log10(rb$m),pch=20,col="darkgrey")
-  md <- loess(log10(rb$m)~rb$fraction,surface = "direct" ,span=0.5) 
-  points(md$x,md$fitted,type="l",col = 2,lwd=2)  
-  md_1 <- loess(log10(rb$q1)~rb$fraction,surface = "direct" ,span=0.5) 
-  points(md_1$x,md_1$fitted,type="l",col = 3)  
-  md_2 <- loess(log10(rb$q2)~rb$fraction,surface = "direct" ,span=0.5) 
-  points(md_2$x,md_2$fitted,type="l",col = 3) 
-  
-  qs <- quantile(md$fitted[order(md$x)],na.rm = T)
-  axis(4,at=qs,labels = paste(round((10^qs)/1000),"kD"),4,las=2,cex=0.5)
-  abline(h=qs,lty=c(3,2,1,2,3)) 
-  
-  mdlist <- list(md=md,hi=md_1,lo=md_2)
-  
-  input$MW_Predictor = mdlist$md
-  input$MW_Predictor_addon = mdlist 
-  
-  input
-  
-})
+        seq <- se[se$ens == x, ]
+        tempfun <- UniSequences_all[ENSG == x, ]
 
-dev.off()
-    # save(TableListNormEnsHdbScanMW,file="TableListNormEnsHdbScanMW.rda")
-    
-    TableListNormEnsHdbScanMW_noSeq <- lapply(TableListNormEnsHdbScanMW,function(x){
-      x$Protein_MW$SEQUENCE <- NULL
-      x
-    })
-    check <- TableListNormEnsHdbScanMW_noSeq[[1]]
-    length(check$Protein_MW)
-  
-    TableListNormEnsHdbScanMW_noSeq <- lapply(TableListNormEnsHdbScanMW_noSeq,function(x){
-      hdb <- x$hdbscanTables
-      hdb[,cl_2_corrected:={
-        temp <- .SD
-        
-        if(dim(temp)[1]==1){
-          ret <- 0
-        }else{
-          ret <- .BY$cl_2
+        if (dim(tempfun)[1] == 1) {
+          OutMW <- as.character(tempfun$MW)
+        } else {
+          OutMW <- sapply(seq$seq, function(x) {
+            paste(unique(tempfun$MW[grep(x, tempfun$SEQUENCE, fixed = TRUE)]), collapse = ";")
+          })
         }
-        ret
-      },.(EnsG,cl_2)]
-      hdb$cl_2 <- hdb$cl_2_corrected
-      hdb$cl_2_corrected <- NULL
-      x$hdbscanTables <- hdb
-      # plot(hdb$cl_2,hdb$cl_2_corrected)
-      x
-    })
-    
-    save(TableListNormEnsHdbScanMW_noSeq,file="./Experiments/TableListNormEnsHdbScanMW_v4.rda")
-  }else{
-    if(!exists("TableListNormEnsHdbScanMW_noSeq")){
-      hu <- load("./Experiments/TableListNormEnsHdbScanMW_v4.rda")
-    }
-    table(TableListNormEnsHdbScanMW_noSeq[[1]]$InputTable$SearchSpecificity)
-           print(paste("Loading dataset from",file.info("./Experiments/TableListNormEnsHdbScan_v4.rda")$mtime))
 
+        if (length(OutMW) == 0) {
+          OutMW <- "NOTAVAILABLE"
+        }
+
+        data.table(mw = OutMW, ens = x, seq = seq$seq)
+      })
+
+      FunResultsdt <- rbindlist(FunResults)
+      FunResultsdt <- unique(FunResultsdt)
+
+      stopCluster(cl)
+      rm("cl")
+    }
+
+    save(FunResultsdt, file = "./Experiments/FunResultsdt.rda")
+  } else {
+    if (!exists("FunResultsdt")) {
+      lo <- load("./Experiments/FunResultsdt.rda")
+    }
   }
 
- if(!file.exists("./Experiments/TableListNormEnsHdbScanMW_noSeq_noMD.rda")){
-   TableListNormEnsHdbScanMW_noSeq[[3]]$dt_gn[grep("LPCAT1",hgnc_symbol)]
-   TableListNormEnsHdbScanMW_noSeq[[2]]$hdbscanTables[EnsG=="ENSG00000167193"]
+  if (!exists("UniAcc")) {
+    load("./Experiments/ACC_Sequences.rda")
+  }
 
-    Models <- lapply(TableListNormEnsHdbScanMW_noSeq,function(x){
-      x[match(c("MW_Predictor","MW_Predictor_addon"),names(x))]
+  UniAcc <- data.table(UniAcc)
+
+  library(Peptides)
+
+  UniAcc[, MW := {
+    se <- as.double(NA)
+    SEQ <- gsub("U", "Y", .BY$SEQUENCE)
+    SEQ <- gsub("X", "D", SEQ)
+    se <- mw(SEQ, monoisotopic = TRUE)
+    se
+  }, SEQUENCE]
+
+  TableListNormEnsHdbScanMW <- lapply(seq_along(TableListNormEnsHdbScan), function(itx) {
+    print(itx)
+
+    library(pracma)
+
+    input <- TableListNormEnsHdbScan[[itx]]
+
+    peptides <- input$InputTable$Sequence
+    mapData <- input$TMTSubset_final_singlenorm_zscore
+
+    print(paste("Starting", input$xname))
+
+    # Mapping MW of proteins
+    splitfun <- strsplit(input$dt_gn$UniAccession, ";")
+    ACC_stripped <- sapply(splitfun, function(x) x[1])
+    ACC_stripped <- gsub("-..$", "", ACC_stripped)
+    acc <- unique(ACC_stripped)
+
+    UniAccM <- UniAcc[match(ACC_stripped, UNIPROTKB)]
+
+    # hist(nchar(UniAccM$SEQUENCE))
+
+    input$Protein_MW <- UniAccM
+
+    #########
+
+    mapData$MW <- input$Protein_MW$MW
+    mapData$Sequence <- peptides
+
+    # Filter For
+    Sel <- sapply(strsplit(input$InputTable$Proteins, ";"), function(x) {
+      length(unique(gsub("_.*.", "", x)))
     })
-    print("Plots for MW modelling can be found in ./Experiments/ISOFRAC_Gels_MW_Mapping.pdf")
-    names(Models) <- sapply(TableListNormEnsHdbScanMW_noSeq,function(x){x$xname})
-    save(Models,file="MW_Models_v3.rda")
-     
-    TableListNormEnsHdbScanMW_noSeq_noMD <- lapply(TableListNormEnsHdbScanMW_noSeq,function(x){
-      x$MW_Predictor<- NULL
-      x$MW_Predictor_addon<- NULL
-      x
+
+    SelSum <- table(Sel)
+    SelSumSel <- SelSum[SelSum > 500]  # minimize number of multiple Mapping Proteins
+
+    sel <- Sel == names(SelSumSel[names(SelSumSel) == min(names(SelSumSel))])
+
+    dt_gn_spec <- input$dt_gn[sel, ]
+    mapDataSpec <- mapData[sel, ]
+
+    print("Starting ENSP Mapping")
+
+    ENSPMW <- FunResultsdt[match(dt_gn_spec$seq, FunResultsdt$seq)]
+
+    options(warn = -1)
+    MeltDataSpecific <- mapData[sel, {
+      temp <- .SD
+      temp <- unlist(temp)[1:28]
+      sel <- temp == max(temp, na.rm = TRUE)
+      sel[is.na(sel)] <- FALSE
+      sel[is.infinite(sel)] <- FALSE
+      which(sel)
+    }, .(Sequence)]
+    options(warn = 1)
+
+    table(MeltDataSpecific$V1)
+
+    MeltDataSpecific$MW_ENSP <- ENSPMW[match(MeltDataSpecific$Sequence, ENSPMW$seq), ]$mw
+
+    ggplot(MeltDataSpecific, aes(jitter(V1), log10(as.numeric(MW_ENSP)))) +
+      geom_bin2d(bins = 100)
+
+    ggplot(data = MeltDataSpecific, aes(V1, log10(as.numeric(MW_ENSP)))) +
+      stat_density2d(
+        aes(fill = ..density..^0.5),
+        geom = "tile",
+        contour = FALSE,
+        n = 300
+      ) +
+      scale_fill_continuous(low = "white", high = "darkblue") +
+      theme(legend.position = "none")
+
+    smoothScatter(
+      MeltDataSpecific$V1,
+      log10(as.numeric(MeltDataSpecific$MW_ENSP)),
+      axes = TRUE,
+      ylab = "mw Da",
+      xlab = "fraction",
+      main = input$xname,
+      ylim = c(3, 6)
+    )
+    mtext("All")
+
+    mwt <- sapply(seq(1, 20, by = 0.5), function(x) 10^x)
+    axis(2, at = log10(mwt), labels = paste(round(mwt / 1000), "kD"))
+    axis(1)
+
+    LAFU <- lapply(seq_len(50), function(i) {
+      MW_density <- MeltDataSpecific[, {
+        MW_temp <- .SD
+        temp_d <- density(log2(sample(as.numeric(MW_temp$MW_ENSP), replace = TRUE)), bw = 0.1, na.rm = TRUE)
+
+        fi_p <- findpeaks(temp_d$y)
+        mw_sel <- fi_p[fi_p[, 1] == max(fi_p[, 1]), ]
+        wi <- 0.2
+
+        qs <- quantile(
+          temp_d$x[temp_d$x >= (temp_d$x[mw_sel[2]] - wi) & temp_d$x <= (temp_d$x[mw_sel[2]] + wi)],
+          probs = c(0.1, 0.9)
+        )
+
+        list(
+          m = 2^temp_d$x[mw_sel[2]],
+          q1 = 2^qs[1],
+          q2 = 2^qs[2]
+        )
+      }, .(fraction = V1)]
+
+      lmMod <- lm(log10(MW_density$m) ~ MW_density$fraction)
+
+      sel <- abs(lmMod$residuals) > 0.5
+
+      abline(coefficients(lmMod), col = 2, lwd = "dotted")
+
+      lo2 <- loess(log10(MW_density$m)[!sel] ~ MW_density$fraction[!sel], span = 0.5, surface = "direct")
+      lo2_lo <- loess(log10(MW_density$q1)[!sel] ~ MW_density$fraction[!sel], span = 0.5, surface = "direct")
+      lo2_hi <- loess(log10(MW_density$q2)[!sel] ~ MW_density$fraction[!sel], span = 0.5, surface = "direct")
+
+      points(lo2$x[order(lo2$x)], lo2$fitted[order(lo2$x)], type = "l", col = "red", alpha = 0.5, lwd = 3)
+      points(lo2_lo$x[order(lo2_lo$x)], lo2_lo$fitted[order(lo2_lo$x)], type = "l", col = "lightgreen", alpha = 0.5, lwd = "dotted")
+      points(lo2_hi$x[order(lo2_hi$x)], lo2_hi$fitted[order(lo2_hi$x)], type = "l", col = "lightgreen", alpha = 0.5, lwd = "dotted")
+
+      qs <- quantile(lo2$fitted[order(lo2$x)], na.rm = TRUE)
+      axis(4, at = qs, labels = paste(round((10^qs) / 1000), "kD"), 4, las = 2, cex = 0.5)
+      abline(h = qs, lty = c(3, 2, 1, 2, 3))
+
+      list(
+        md = lo2,
+        md_lo = lo2_lo,
+        md_hi = lo2_hi,
+        MW_density = MW_density,
+        lmMod = lmMod$residuals
+      )
     })
-    FractionsToMWList <- lapply(Models,function(x){
-      predict(x$MW_Predictor,1:28)
+
+    rb <- rbindlist(lapply(LAFU, function(x) {
+      x <<- x
+      sel <- abs(x$lmMod) < 0.5
+      x$MW_density[sel]
+    }))
+    rb <- rb[order(rb$fraction)]
+
+    smoothScatter(
+      MeltDataSpecific$V1,
+      log10(as.numeric(MeltDataSpecific$MW_ENSP)),
+      axes = TRUE,
+      ylab = "mw Da",
+      xlab = "fraction",
+      main = paste(gsub("/.*.", "", input$xname), "Step 2 Loess on average Bootstrapping points", sep = "\n")
+    )
+    points(rb$fraction, log10(rb$m), pch = 20, col = "darkgrey")
+
+    md <- loess(log10(rb$m) ~ rb$fraction, surface = "direct", span = 0.5)
+    points(md$x, md$fitted, type = "l", col = 2, lwd = 2)
+
+    md_1 <- loess(log10(rb$q1) ~ rb$fraction, surface = "direct", span = 0.5)
+    points(md_1$x, md_1$fitted, type = "l", col = 3)
+
+    md_2 <- loess(log10(rb$q2) ~ rb$fraction, surface = "direct", span = 0.5)
+    points(md_2$x, md_2$fitted, type = "l", col = 3)
+
+    qs <- quantile(md$fitted[order(md$x)], na.rm = TRUE)
+    axis(4, at = qs, labels = paste(round((10^qs) / 1000), "kD"), 4, las = 2, cex = 0.5)
+    abline(h = qs, lty = c(3, 2, 1, 2, 3))
+
+    mdlist <- list(md = md, hi = md_1, lo = md_2)
+
+    input$MW_Predictor <- mdlist$md
+    input$MW_Predictor_addon <- mdlist
+
+    input
+  })
+
+  dev.off()
+
+  TableListNormEnsHdbScanMW_noSeq <- lapply(TableListNormEnsHdbScanMW, function(x) {
+    x$Protein_MW$SEQUENCE <- NULL
+    x
+  })
+
+  check <- TableListNormEnsHdbScanMW_noSeq[[1]]
+  length(check$Protein_MW)
+
+  TableListNormEnsHdbScanMW_noSeq <- lapply(TableListNormEnsHdbScanMW_noSeq, function(x) {
+    hdb <- x$hdbscanTables
+
+    hdb[, cl_2_corrected := {
+      temp <- .SD
+      if (dim(temp)[1] == 1) {
+        ret <- 0
+      } else {
+        ret <- .BY$cl_2
+      }
+      ret
+    }, .(EnsG, cl_2)]
+
+    hdb$cl_2 <- hdb$cl_2_corrected
+    hdb$cl_2_corrected <- NULL
+    x$hdbscanTables <- hdb
+    x
+  })
+
+  save(TableListNormEnsHdbScanMW_noSeq, file = "./Experiments/TableListNormEnsHdbScanMW_v4.rda")
+} else {
+  if (!exists("TableListNormEnsHdbScanMW_noSeq")) {
+    hu <- load("./Experiments/TableListNormEnsHdbScanMW_v4.rda")
+  }
+
+  table(TableListNormEnsHdbScanMW_noSeq[[1]]$InputTable$SearchSpecificity)
+  print(paste("Loading dataset from", file.info("./Experiments/TableListNormEnsHdbScan_v4.rda")$mtime))
+}
+
+if (!file.exists("./Experiments/TableListNormEnsHdbScanMW_noSeq_noMD.rda")) {
+  TableListNormEnsHdbScanMW_noSeq[[3]]$dt_gn[grep("LPCAT1", hgnc_symbol)]
+  TableListNormEnsHdbScanMW_noSeq[[2]]$hdbscanTables[EnsG == "ENSG00000167193"]
+
+  Models <- lapply(TableListNormEnsHdbScanMW_noSeq, function(x) {
+    x[match(c("MW_Predictor", "MW_Predictor_addon"), names(x))]
+  })
+
+  print("Plots for MW modelling can be found in ./Experiments/ISOFRAC_Gels_MW_Mapping.pdf")
+  names(Models) <- sapply(TableListNormEnsHdbScanMW_noSeq, function(x) x$xname)
+  save(Models, file = "MW_Models_v3.rda")
+
+  TableListNormEnsHdbScanMW_noSeq_noMD <- lapply(TableListNormEnsHdbScanMW_noSeq, function(x) {
+    x$MW_Predictor <- NULL
+    x$MW_Predictor_addon <- NULL
+    x
+  })
+
+  FractionsToMWList <- lapply(Models, function(x) {
+    predict(x$MW_Predictor, 1:28)
+  })
+
+  checkClusterLengths <- function(x) {
+    barplot(table(x$hdbscanTables[cl_2 != 0, length(unique(Seq)), .(cl_2, EnsG)]$V1))
+  }
+
+  if (length(TableListNormEnsHdbScanMW_noSeq_noMD) == length(FractionsToMWList)) {
+    TableListNormEnsHdbScanMW_noSeq_noMD <- lapply(seq_along(FractionsToMWList), function(it) {
+      input <- TableListNormEnsHdbScanMW_noSeq_noMD[[it]]
+      predicted <- FractionsToMWList[[it]]
+      input$Fractions_predicted_MW <- predicted
+      input
     })
-    
-    checkClusterLengths <- function(x){
-      barplot(table(x$hdbscanTables[cl_2!=0,length(unique(Seq)),.(cl_2,EnsG)]$V1))
-    }
-    
-    # checkClusterLengths(TableListNormEnsHdbScanMW_noSeq_noMD[[4]])
-    if(length(TableListNormEnsHdbScanMW_noSeq_noMD)==length(FractionsToMWList)){
-  
-      TableListNormEnsHdbScanMW_noSeq_noMD <-  lapply(1:length(FractionsToMWList),function(it){
-        input <- TableListNormEnsHdbScanMW_noSeq_noMD[[it]]
-        predicted <- FractionsToMWList[[it]]
-        input$Fractions_predicted_MW <- predicted
-        input
-      })
-    }
-   TableListNormEnsHdbScanMW_noSeq_noMD[[1]]$hdbscanTables[EnsG=="ENSG00000120802"]$cl_2_nf
-    
-    save(TableListNormEnsHdbScanMW_noSeq_noMD,file="./Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda")
-    lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){table(x$InputTable$SearchSpecificity)})
-    
- }else{
-   if(!exists("TableListNormEnsHdbScanMW_noSeq_noMD")){
-     hu <- load("./Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda")
-    print(paste("Loading dataset from",file.info("./Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda")$mtime))
-# "E:/MaxQuant/HZ/20220114_Isofrac_v2/IsoFracCompiler2_noSemitryptic/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda"
-   }
-   
- }
+  }
+
+  TableListNormEnsHdbScanMW_noSeq_noMD[[1]]$hdbscanTables[EnsG == "ENSG00000120802"]$cl_2_nf
+
+  save(TableListNormEnsHdbScanMW_noSeq_noMD, file = "./Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda")
+  lapply(TableListNormEnsHdbScanMW_noSeq_noMD, function(x) {
+    table(x$InputTable$SearchSpecificity)
+  })
+} else {
+  if (!exists("TableListNormEnsHdbScanMW_noSeq_noMD")) {
+    hu <- load("./Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda")
+    print(paste("Loading dataset from", file.info("./Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda")$mtime))
+  }
+}
 
 table(TableListNormEnsHdbScanMW_noSeq_noMD[[3]]$InputTable$SearchSpecificity)
 ```
@@ -1926,161 +1696,19 @@ table(TableListNormEnsHdbScanMW_noSeq_noMD[[3]]$InputTable$SearchSpecificity)
 -  Step 1 is complete
 -  Continue with Step 2 (PeakFinder Module)
 
-## Manuscript Relevant numbers:
-```{r}
-lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){x$xname})
-dt_gn <- lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){x$dt_gn[grep("^REV_",x$dt_gn$UniAccession,invert=T)]})
-se <- lapply(dt_gn[-1],function(x){x$seq})
-pg <- lapply(dt_gn[-1],function(x){x$UniAccession})
-en <- lapply(dt_gn[-1],function(x){gsub(";.*.","",x$ens)})
 
-df <- data.frame(desc="Numbers of all sequences, pgs and genes:",seq=length(unique(unlist(se))),pg=length(unique(unlist(pg))),EnsG=length(unique(unlist(en))))
+## Cross-Correlation Analysis
 
-dt_gn <- lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){x$dt_gn[!grepl("^REV_",x$dt_gn$UniAccession)&!grepl(";",x$dt_gn$ens)]})
-se <- lapply(dt_gn[-1],function(x){x$seq})
-pg <- lapply(dt_gn[-1],function(x){x$UniAccession})
-en <- lapply(dt_gn[-1],function(x){gsub(";.*.","",x$ens)})
+This analysis evaluates the internal consistency of peptide traces within genes and serves as an orthogonal validation of IsoFrac clustering.
+	-	For each gene, pairwise Pearson correlations (R) are calculated between all peptide fractionation traces assigned to that gene.
+	-	As a control, random peptide sets of equal size are sampled from other genes and subjected to the same correlation analysis.
+	-	Two metrics are evaluated:
+	  -	 Peptide-level correlation: Correlation between individual peptide traces within a gene.
+	  -	 Gene-level median correlation: Median R value across all peptide pairs per gene.
+	-	Receiver Operating Characteristic (ROC) curves are generated by comparing real (within-gene) correlations to random controls.
+	-	The Area Under the Curve (AUC) quantifies how well IsoFrac clustering distinguishes biologically coherent peptide groups from random peptide sets.
 
-df2 <- data.frame(desc="Numbers from genotypic sequences",seq=length(unique(unlist(se))),pg=length(unique(unlist(pg))),EnsG=length(unique(unlist(en))))
-
-print(rbind(df,df2))
-```
-
-
-```{r}
-cl_2 <- lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){
- cl <-  x$hdbscanTables[grep(";",EnsG,invert = T),{length(unique(cl_2))},EnsG]
-cl$gel <- x$xname
-cl 
-})
-
-
-clfun <- rbindlist(cl_2)
-
-clfun[,.(Clusters=length(V1),M=mean(as.double(V1))),gel]
-clfun$gelname <- "unknown"
-clfun$gelname[clfun$gel=="txt_2021_10_09_TMTpro_8per_Try_MBR/peptides_TryChymCombined.txt"] <- "8% Gel; Trypsin +Chymotrypsin"
-clfun$gelname[clfun$gel=="txt_2021_01_30_TMTpro_5er_MBR/peptides.txt"] <- "5% Gel; Trypsin"
-clfun$gelname[clfun$gel=="txt_2020_12_23_TMTpro_8per_MBR/peptides.txt"] <- "8% Gel; Trypsin"
-clfun$gelname[clfun$gel=="txt_2020_12_23_TMTpro_10per_MBR/peptides.txt"] <- "10% Gel; Trypsin"
-clfun$gelname <- factor(clfun$gelname,c("5% Gel; Trypsin","8% Gel; Trypsin +Chymotrypsin","8% Gel; Trypsin","10% Gel; Trypsin"))
-table(clfun$gelname)
-
-ggplot(clfun[gelname!="8% Gel; Trypsin +Chymotrypsin"],aes(V1,fill=gelname,color=gelname))+geom_density(lwd=1,stat = "count")+xlab("hdbscan Clusters per Gene")+facet_wrap("gelname")
-
-
-```
-
-## Gel Info
-
-```{r}
-#FunResultsdt
-#UniACC
-ModelData <- lapply(1:length(TableListNormEnsHdbScanMW_Peaks),function(itx){
-  
-  print(itx)
-  
-  library(pracma)
-  input <- TableListNormEnsHdbScanMW_noSeq[[itx]]
-  
-  peptides <- input$InputTable$Sequence
-  mapData  <- input$TMTSubset_final_singlenorm_zscore
-  print(paste("Starting",input$xname))
-  # Mapping mw of proteins
-  splitfun <- strsplit(input$dt_gn$UniAccession,";")
-  ACC_stripped <- sapply(splitfun,function(x){x[1]})
-  # ACC_stripped <- gsub("-.$","",sapply(strsplit(input$dt_gn$UniAccession,";"),"[[",1))
-  ACC_stripped <- gsub("-..$","",ACC_stripped)
-  acc <- unique(ACC_stripped)
-  UniAcc <- as.data.table(UniAcc)
-  
-  UniAccM <- UniAcc[match(ACC_stripped,UNIPROTKB)]
-  
-  # hist(nchar(UniAccM$SEQUENCE))
-  
-  input$Protein_MW <- UniAccM
-  
-  #########
-  
-  mapData$MW <- input$Protein_MW$MW
-  mapData$Sequence <- peptides
-  # table(Sel)
-  # Filter For
-  Sel <- sapply(strsplit(input$InputTable$Proteins,";"),function(x){
-    length(unique(gsub("_.*.","",x)))
-  })
-  SelSum <- table(Sel)
-  SelSumSel <- SelSum[SelSum>500]# minimize number of multiple Mapping Proteins
-  
-  sel <- Sel==names(SelSumSel[names(SelSumSel)==min(names(SelSumSel))])#input$InputTable$`Unique (Proteins)`=="yes"
-  
-  dt_gn_spec <- input$dt_gn[sel,]
-  # FunResultsdt[match(dt_gn_spec$seq,FunResultsdt$seq)]
-  mapDataSpec <- mapData[sel,]
-  print("Starting ENSP Mapping")
-  ENSPMW <- FunResultsdt[match(dt_gn_spec$seq,FunResultsdt$seq)]
-  
-  options(warn=-1)
-  MeltDataSpecific <- mapData[sel,{
-    # cat("\r",.GRP)
-    temp <- .SD
-    temp <- unlist(temp)[1:28]
-    sel <- temp==max(temp,na.rm = T)
-    sel[is.na(sel)]<- F
-    sel[is.infinite(sel)]<- F
-
-    # if(any(is.))
-    which(sel)
-    
-    
-  },.(Sequence)]
-  options(warn=1)
-
-  table(MeltDataSpecific$V1)
-  
-  MeltDataSpecific$MW_ENSP <- ENSPMW[match(MeltDataSpecific$Sequence,ENSPMW$seq),]$mw
-  MeltDataSpecific$Type <- input$xname
-  MeltDataSpecific
-#   ggplot(MeltDataSpecific,aes(jitter(V1),log10(as.numeric(MW_ENSP))))+geom_bin2d(bins=100)
-#   
-#   
-# ggplot(data = MeltDataSpecific, aes(V1, log10(as.numeric(MW_ENSP)))) +   stat_density2d(aes(fill = ..density..^0.5), geom = "tile", contour = FALSE, n = 300) +   scale_fill_continuous(low = "white", high = "darkblue")+theme(legend.position = "none")
-
-})
-table(TableListNormEnsHdbScanMW_noSeq[[1]]$InputTable$SearchSpecificity)
-
-```
-
-```{r}
-
-DensColor  <- "darkblue"
-gg5 <- ggplot(data = ModelData[[1]], aes(V1, log10(as.numeric(MW_ENSP)))) +   stat_density2d(aes(fill = ..density..^0.3), geom = "tile", contour = FALSE, n = 300) +   scale_fill_continuous(low = "white", high = DensColor)+theme(legend.position = "none")
-gg8 <- ggplot(data = ModelData[[2]], aes(V1, log10(as.numeric(MW_ENSP)))) +   stat_density2d(aes(fill = ..density..^0.5), geom = "tile", contour = FALSE, n = 300) +   scale_fill_continuous(low = "white", high = DensColor)+theme(legend.position = "none")
-gg10 <- ggplot(data = ModelData[[3]], aes(V1, log10(as.numeric(MW_ENSP)))) +   stat_density2d(aes(fill = ..density..^0.5), geom = "tile", contour = FALSE, n = 300) +   scale_fill_continuous(low = "white", high = DensColor)+theme(legend.position = "none")
-
-Models1 <- lapply(Models,function(x){
-  x <<- x
-  x$LineData <- data.frame(x=x$MW_Predictor$x[,1],y=x$MW_Predictor$fitted)
-  x
-})
-
-xlabstring <- "Fraction (incr. MW)"
-gg5a <- gg5+annotate("line",Models1[[1]]$LineData$x,Models1[[1]]$LineData$y,color=2,lwd=1)+theme_classic()+xlab(xlabstring)+ylab("Molecular Weight [kD]")+geom_hline(yintercept = qs1 <- quantile(Models1[[1]]$LineData$y),lty="dotted")+scale_y_continuous(labels = function(x){return(paste0( round(10^x/1000)))},breaks = qs1)+theme(legend.position = "none")+ggtitle("5% gel")
-
-gg8a <- gg8+annotate("line",Models1[[2]]$LineData$x,Models1[[2]]$LineData$y,color=2,lwd=1)+theme_classic()+xlab(xlabstring)+ylab("Molecular Weight [kD]")+geom_hline(yintercept = qs1 <- quantile(Models1[[2]]$LineData$y),lty="dotted")+scale_y_continuous(labels = function(x){return(paste0( round(10^x/1000)))},breaks = qs1)+theme(legend.position = "none")+ggtitle("8% gel")
-
-gg10a <- gg10+annotate("line",Models1[[3]]$LineData$x,Models1[[3]]$LineData$y,color=2,lwd=1)+theme_classic()+xlab(xlabstring)+ylab("Molecular Weight [kD]")+geom_hline(yintercept = qs1 <- quantile(Models1[[3]]$LineData$y),lty="dotted")+scale_y_continuous(labels = function(x){return(paste0( round(10^x/1000)))},breaks = qs1)+theme(legend.position = "none")+ggtitle("10% gel")
-gels <- plot_grid(gg10a,gg8a,gg5a,align = "h",ncol=3)
-
-gels
-
-pdf("Gel8.pdf",width=4,height=3)
-gg8a
-dev.off()
-```
-
-## cross correlation analysis
-
+This analysis provides a quantitative measure of signal coherence and supports the specificity of the clustering approach.
 
 ```{r}
 if(!exists("CrossCorrelationData.rda")){
