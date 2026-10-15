@@ -1,0 +1,1218 @@
+---
+title: "IsoFrac Tool Starter"
+author: "Henrik Zauber"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+  toc: yes
+toc_depth: 2
+toc_float: yes
+number_sections: yes
+code_folding: hide
+pdf_document:
+  toc: yes
+toc_depth: '2'
+editor_options:
+  chunk_output_type: console
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# IsoFrac Analyzer
+
+Input: DIANN report.tsv tables and a fasta database (UniProt, other naming formats might be incompatible with the current code)
+
+# Disclaimer
+
+## Research Use Only
+
+This software is provided as a research tool to facilitate the analysis of label-free DIA (Data-Independent Acquisition) proteomics data generated using DIA-NN. It is intended as a starting point (primer) for developing customized analysis workflows and is not designed as a universal or validated solution for all experimental designs.
+
+This implementation deviates from the analysis workflow originally submitted and described in the associated manuscript. It incorporates modifications, refinements, and additional functionality that have been introduced during continued development. Consequently, results generated with this version may not be identical to those reported in the publication.
+
+Users are responsible for verifying that the implemented methods, parameters, and assumptions are appropriate for their specific experimental setup, biological question, and data quality. Depending on the study design, modifications to the code, statistical methods, filtering criteria, or visualization routines may be necessary.
+
+## No Warranty
+
+This software is provided “as is”, without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, non-infringement, accuracy, or completeness. The authors make no guarantees regarding the correctness, reliability, performance, or suitability of the software or the results it produces.
+
+## Limitation of Liability
+
+To the fullest extent permitted by applicable law, the authors shall not be liable for any direct, indirect, incidental, consequential, special, or exemplary damages arising from the use of, or inability to use, this software, including but not limited to loss of data, incorrect scientific conclusions, or other research-related outcomes.
+
+By using this software, users acknowledge that they have read and understood this disclaimer and accept full responsibility for validating all analyses and interpreting the resulting data.
+
+# Start of Analysis
+
+## Loading Data
+
+```{r ,echo=FALSE}
+library(data.table)
+library(Peptides)
+library(ggplot2)
+# Working directory
+setwd(dirname(rstudioapi::documentPath()))
+FastaPath <- "./UniprotReferenceProteomeHuman_UP000005640_2022.fasta"
+Diann_Report_Path <- "report.tsv"
+
+da <- fread(Diann_Report_Path)
+
+```
+
+## Experimental Design and Fractions:
+
+```{r}
+assign_samples_to_experiments <- function(sample_names) {
+  require(tcltk)
+  require(data.table)
+  
+  tt <- tktoplevel()
+  tkwm.title(tt, "Sample to Experiment Assignment")
+  result_assign_samples_to_experiments <- data.table(Sample = sample_names, Experiment = NA_character_)
+  
+  main_frame <- tkframe(tt)
+  tkgrid(main_frame)
+  
+  # Top Left: Mode selection
+  frame_mode <- tkframe(main_frame)
+  tkgrid(frame_mode, row = 0, column = 0, sticky = "nw")
+  
+  mode <- tclVar("manual")
+  tkpack(tklabel(frame_mode, text = "Choose Assignment Mode"), anchor = "w")
+  tkpack(tkradiobutton(frame_mode, text = "Manual", value = "manual", variable = mode), anchor = "w")
+  tkpack(tkradiobutton(frame_mode, text = "Dropdown (Predefined Experiments)", value = "dropdown", variable = mode), anchor = "w")
+  tkpack(tkradiobutton(frame_mode, text = "Regex", value = "regex", variable = mode), anchor = "w")
+  tkpack(tkradiobutton(frame_mode, text = "strsplit", value = "split", variable = mode), anchor = "w")
+  
+  # Top Right: Assignment options
+  frame_options <- tkframe(main_frame)
+  tkgrid(frame_options, row = 0, column = 1, sticky = "new")
+  
+  experiment_list_var <- tclVar("")
+  regex_var <- tclVar("")
+  split_var <- tclVar("_")
+  slot_var <- tclVar("2")
+  
+  tkpack(tklabel(frame_options, text = "Experiments (comma separated):"), anchor = "w")
+  tkpack(tkentry(frame_options, textvariable = experiment_list_var, width = 40), anchor = "w")
+  tkpack(tklabel(frame_options, text = "Regex pattern (with capture group):"), anchor = "w")
+  tkpack(tkentry(frame_options, textvariable = regex_var, width = 40), anchor = "w")
+  tkpack(tklabel(frame_options, text = "Split by (e.g. _):"), anchor = "w")
+  tkpack(tkentry(frame_options, textvariable = split_var, width = 10), anchor = "w")
+  tkpack(tklabel(frame_options, text = "Slot(s) (e.g. 1,3):"), anchor = "w")
+  tkpack(tkentry(frame_options, textvariable = slot_var, width = 10), anchor = "w")
+  
+  apply_mode <- function() {
+    mode_sel <- tclvalue(mode)
+    if (mode_sel == "manual") {
+      for (i in seq_along(list_vars)) {
+        result_assign_samples_to_experiments$Experiment[i] <- tclvalue(list_vars[[i]])
+      }
+    } else if (mode_sel == "dropdown") {
+      exps <- unlist(strsplit(tclvalue(experiment_list_var), ",\\s*"))
+      for (i in seq_along(sample_names)) {
+        exp <- tk_select.list(exps, title = paste("Assign experiment for:", sample_names[i]))
+        result_assign_samples_to_experiments$Experiment[i] <- exp
+      }
+    } else if (mode_sel == "regex") {
+      pattern <- tclvalue(regex_var)
+      for (i in seq_along(sample_names)) {
+        match <- regmatches(sample_names[i], regexec(pattern, sample_names[i]))
+        result_assign_samples_to_experiments$Experiment[i] <- if (length(match[[1]]) > 1) match[[1]][2] else NA_character_
+      }
+    } else if (mode_sel == "split") {
+      split_char <- tclvalue(split_var)
+      slots <- as.integer(unlist(strsplit(tclvalue(slot_var), ",")))
+      for (i in seq_along(sample_names)) {
+        parts <- unlist(strsplit(sample_names[i], split_char))
+        selected <- parts[slots[slots <= length(parts)]]
+        result_assign_samples_to_experiments$Experiment[i] <- paste(selected, collapse = "_")
+      }
+    }
+    for (i in seq_along(sample_names)) {
+      tclvalue(list_vars[[i]]) <- result_assign_samples_to_experiments$Experiment[i]
+    }
+  }
+  
+  apply_btn <- tkbutton(frame_options, text = "Apply Mode", command = apply_mode)
+  tkpack(apply_btn, anchor = "w", pady = 10)
+  
+  # Bottom: Scrollable sample list
+  canvas <- tkcanvas(main_frame, width = 600, height = 300)
+  scroll <- tkscrollbar(main_frame, orient = "vertical", command = function(...) tkyview(canvas, ...))
+  tkconfigure(canvas, yscrollcommand = function(...) tkset(scroll, ...))
+  tkgrid(canvas, scroll, row = 1, column = 0, columnspan = 1, sticky = "nsew")
+  tkgrid(scroll, row = 1, column = 1, sticky = "ns")
+  
+  sample_frame <- tkframe(canvas)
+  tkcreate(canvas, "window", 0, 0, anchor = "nw", window = sample_frame)
+  tkbind(sample_frame, "<Configure>", function() {
+    tcl("update")
+    bbox <- tkbbox(canvas, "all")
+    tkconfigure(canvas, scrollregion = bbox)
+  })
+  
+  tkgrid(tklabel(sample_frame, text = "Sample Assignments"), columnspan = 2)
+  list_vars <- list()
+  assign_widgets <- list()
+  
+  for (i in seq_along(sample_names)) {
+    tkgrid(tklabel(sample_frame, text = sample_names[i]), row = i, column = 0, sticky = "w")
+    var <- tclVar("")
+    entry <- tkentry(sample_frame, textvariable = var, width = 50)
+    list_vars[[i]] <- var
+    assign_widgets[[i]] <- entry
+    tkgrid(entry, row = i, column = 1, sticky = "we")
+  }
+  
+  # Done Button Bottom Right
+  ok_btn <- tkbutton(tt, text = "Done", command = function() {
+    for (i in seq_along(list_vars)) {
+      result_assign_samples_to_experiments$Experiment[i] <<- tclvalue(list_vars[[i]])
+    }
+    tkdestroy(tt)
+  })
+  tkgrid(ok_btn, row = 2, column = 1, sticky = "e", pady = 10)
+  
+  tkwait.window(tt)
+  return(result_assign_samples_to_experiments)
+}
+ED <- assign_samples_to_experiments(unique(da$Run))
+# Assigning Experiment
+da$Experiment <- ED[match(da$Run,ED$Sample)]$Experiment
+# Removing Empty Entries
+da <- da[da$Experiment!=""]
+
+# Assigning Fractions:
+Fr <- assign_samples_to_experiments(unique(da$Run))
+da$Fraction <- Fr[match(da$Run,Fr$Sample)]$Experiment
+da <- da[Lib.Q.Value< 0.01]# apply filters here
+da$CellType <- "Unknown" # PlaceHolder
+```
+
+## Compiling Table
+
+```{r ,echo=FALSE}
+# Defining Experiment paths, multiple rns could be put together
+
+IF_Read_Dia <- function(temp,QuantificationColumn="Ms1.Area"){
+  library(ggplot2)
+  Gene <- temp[,length(unique(Fraction)),Genes]
+
+  # temp$Fraction <- as.numeric(temp$Fraction)
+  
+  tempdcast <- dcast(temp,Protein.Group+Genes+Modified.Sequence+Precursor.Charge~Fraction,value.var = QuantificationColumn,fun.aggregate=max)
+  Posinfo <- which(names(tempdcast)=="Precursor.Charge")
+  infotable <- as.data.frame(tempdcast)[,1:Posinfo]
+  Traces <- as.data.frame(tempdcast)[,(Posinfo+1):dim(tempdcast)[2]]
+  
+  BadEntries <- apply(Traces,1,function(x){sum(is.infinite(unlist(x)))})
+  
+  list(Original=temp,InfoTable=infotable,traces=Traces,traces_scaled = t(scale(t(Traces))),BadCount = BadEntries)
+}
+
+da_split <- split(da,da$Experiment)
+CompiledTable_list <- lapply(da_split,IF_Read_Dia)
+
+
+```
+
+
+## Functions
+
+```{r}
+PeakTesting <- function(tempsel,temp,Candidates,samplingrounds = 50,seed=T,cutoff=0.1){
+  set.seed(1234)
+  tempsel <<- tempsel
+  temp <<- temp
+  
+  # Generating Comparison Matrix for statistical Testing
+  distributionCheck <- function(x){
+    sdval <- 10^c(x$MW_lm,x$MW_fr_gel_hi,x$MW_lm_gel_lo)
+    rnorm(10,mean=10^x$MW_lm,sd = sd(sdval))
+  }
+  
+  hu <- lapply(1:samplingrounds,function(x){
+    ComparisonMatrix <- lapply(1:dim(temp)[1],function(i){
+      temp <- temp[i, ]
+      vecfun <- distributionCheck(temp)
+      list(Data=vecfun,Sample=i,MW=10^as.numeric(temp$MW_lm[i]))
+    })
+    ComparisonMatrix <- rbindlist(ComparisonMatrix)
+    ComparisonMatrix$MW <- round(10^temp$MW_lm[ComparisonMatrix$Sample])
+    options(warn=-1)
+    pvalues <- sapply(Candidates$CandidateID,function(it){
+      a <- ComparisonMatrix[Sample==tempsel$CandidateID]
+      b <- ComparisonMatrix[Sample==it]
+      pval <- as.double(NA)
+      try(pval <- wilcox.test(a$Data,b$Data)$p.value)
+      
+      
+    })
+    
+    options(warn=1)
+    
+    list(pvalues=pvalues,ID=Candidates$CandidateID,Sampling=x)
+  })
+  ComparisonMatrix <- rbindlist(hu)
+  
+  SimilarityIndex <- ComparisonMatrix[,any(pvalues>cutoff),ID]
+  temp$similarities <- SimilarityIndex$V1[match(temp$CandidateID,SimilarityIndex$ID)]
+  
+  list(ComparisonMatrix=ComparisonMatrix,SimilarityIndex=SimilarityIndex,temp=temp)
+}
+
+MW_Trace <- function(input,UNIPROTKB=NULL,FractionCutoff=c(1,10000),bs_rounds=50){
+  # ggplot(,aes(Fraction,log10(MW)))+geom_bin2d()+facet_grid("CellType")+ggtitle("PG first entry MW")+geom_smooth()+
+  # annotate("segment",x=1,xend=12,y = upperlimit,yend = upperlimit,color="orange")+annotate("text",x=4,xend=10,y = upperlimit,yend = upperlimit,label="Signal",color="orange",vjust=1)+
+  # annotate("segment",x=1,xend=1,y = upperlimit,yend = lowerlimit,color="orange")+annotate("text",x=0,xend=0,y = av,yend = av,label=paste("MW signal",paste(round(10^c(lowerlimit,upperlimit)/1000),collapse=" to "),"kd"),color="orange",vjust=0,angle=90)
+  library(pracma)
+  input <- ori
+  # 
+  input$Fraction <- factor(input$Fraction,1:max(input$Fraction,na.rm=T))
+  input[,AnySignal :={any(Ms1.Area>0)},CellType]
+  inputMini <- input[AnySignal==T]
+  mapData  <- dcast(inputMini,Stripped.Sequence+Protein.Group~Fraction,fun.aggregate = sum,value.var = "Ms1.Area",fill = 0,drop = c(TRUE,FALSE))
+  
+  peptides <- mapData$Stripped.Sequence
+  proteins <- mapData$Protein.Group
+  
+  mapData$Stripped.Sequence <- NULL
+  mapData$Protein.Group <- NULL
+  
+  # Mapping mw of proteins
+  splitfun <- strsplit(proteins,";")
+  ACC_stripped <- sapply(splitfun,function(x){x[1]})
+  # ACC_stripped <- gsub("-.$","",sapply(strsplit(input$dt_gn$UniAccesspepion,";"),"[[",1))
+  ACC_stripped <- gsub("-..$","",ACC_stripped)
+  acc <- unique(ACC_stripped)
+  
+  if(length(UNIPROTKB)==0){
+    warning("no DB provided")
+    return(NULL)
+  }
+  UniAccM <- UNIPROTKB[match(ACC_stripped,IDclean)]
+  
+
+  
+  #########
+  
+  mapData$MW <- UniAccM$MW
+  mapData$Sequence <- peptides
+
+  Sel <- sapply(strsplit(proteins,";"),function(x){
+    length(unique(gsub("_.*.","",x)))
+  })
+  SelSum <- table(Sel)
+  SelSumSel <- SelSum[SelSum>500]# minimize number of multiple Mapping Proteins
+  
+  sel <- Sel==names(SelSumSel[names(SelSumSel)==min(names(SelSumSel))])#input$InputTable$`Unique (Proteins)`=="yes"
+  
+  options(warn=-1)
+  MeltDataSpecific <- mapData[sel,{
+    # cat("\r",.GRP)
+    temp <- .SD
+    temp <- unlist(temp)#[1:24]
+    sel <- temp==max(temp,na.rm = T)
+    sel[is.na(sel)]<- F
+    sel[is.infinite(sel)]<- F
+    
+    # if(any(is.))
+    which(sel)
+    
+    
+  },.(Sequence)]
+  options(warn=1)
+  
+  
+  MeltDataSpecific$MW_ENSP <- mapData[match(MeltDataSpecific$Sequence,Sequence),]$MW
+  
+  MeltDataSpecific <- MeltDataSpecific[V1>=FractionCutoff[1]&V1<=FractionCutoff[2]]
+
+  smoothScatter(MeltDataSpecific$V1,log10(as.numeric(MeltDataSpecific$MW_ENSP)),axes=T,ylab="mw Da",xlab="fraction",main=input$xname,ylim=c(3,6))
+  mtext("All")
+  options(warn=-1)
+  LAFU <- lapply(1:bs_rounds,function(i){
+    # cat("\r",i)
+    MW_density <- MeltDataSpecific[,{
+      MW_temp <- .SD
+      li <- NULL
+      try({
+        li <- temp_d<- density(log2(sample(as.numeric(MW_temp$MW_ENSP),replace = T)),bw=0.1,na.rm = T)
+        # plot(temp_d)
+        
+        fi_p <- findpeaks(temp_d$y)
+        mw_sel <- fi_p[fi_p[,1]==max(fi_p[,1]),]
+        wi <- 0.2
+        qs <- quantile(temp_d$x[temp_d$x>=(temp_d$x[mw_sel[2]]-wi)&temp_d$x<=(temp_d$x[mw_sel[2]]+wi)],probs = c(0.1,0.9))
+        # plot(temp_d)
+        # abline(v=temp_d$x[mw_sel[2]])
+        li <- list(m=2^temp_d$x[mw_sel[2]],q1=2^qs[1],q2=2^qs[2])
+      })
+      li
+      
+    },.(fraction=V1)]
+    
+    
+    lmMod <- lm(log10(MW_density$m)~MW_density$fraction)
+
+    sel <- abs(lmMod$residuals)>0.5
+    
+    abline(coefficients(lmMod),col = 2,lwd = "dotted")
+    lo2 <- loess(log10(MW_density$m)[!sel]~MW_density$fraction[!sel],span = 0.5,surface = "direct" )
+    lo2_lo <- loess(log10(MW_density$q1)[!sel]~MW_density$fraction[!sel],span = 0.5,surface = "direct" )
+    lo2_hi <- loess(log10(MW_density$q2)[!sel]~MW_density$fraction[!sel],span = 0.5,surface = "direct" )
+    
+    points(lo2$x[order(lo2$x)],lo2$fitted[order(lo2$x)],type="l",col = "red",alpha=0.5,lwd=3)
+    points(lo2_lo$x[order(lo2_lo$x)],lo2_lo$fitted[order(lo2_lo$x)],type="l",col = "lightgreen",alpha=0.5,lwd = "dotted")
+    points(lo2_hi$x[order(lo2_hi$x)],lo2_hi$fitted[order(lo2_hi$x)],type="l",col = "lightgreen",alpha=0.5,lwd = "dotted")
+    
+    qs <- quantile(lo2$fitted[order(lo2$x)],na.rm = T)
+    axis(4,at=qs,labels = paste(round((10^qs)/1000),"kD"),4,las=2,cex=0.5)
+    abline(h=qs,lty=c(3,2,1,2,3)) 
+    
+    list(md=lo2,md_lo=lo2_lo,md_hi=lo2_hi,MW_density=MW_density,lmMod=lmMod$residuals)
+  })
+  
+  
+  rb <- rbindlist(lapply(LAFU,function(x){
+    x <- x
+    
+    x$MW_density$lmMod <- x$lmMod[match(x$MW_density$fraction,names(x$lmMod))]
+    x$MW_density
+  }))
+  rb <- rb[,{
+    hum <- .SD[abs(lmMod)<0.5]
+    if(dim(hum)[1]==0){
+      print(.BY$fraction)
+      hum <- .SD[abs(lmMod)<1]
+      hum <<- .SD
+    }
+    if(all(is.na(lmMod))){
+      hum <- .SD
+    }
+    hum
+    
+  },fraction]
+  
+  table(rb$fraction)
+  
+  rb <- rb[order(rb$fraction)]
+  
+  pdf("Bootstrap_SmoothScatter_SEC.pdf")
+  par(mai=c(1,1,1,1))
+  smoothScatter(MeltDataSpecific$V1,log10(as.numeric(MeltDataSpecific$MW_ENSP)),axes=T,ylab="mw Da",xlab="fraction",main=paste(gsub("/.*.","",input$xname),"Step 2 Loess on average Bootstrapping points",sep = "\n"))
+  points(rb$fraction,log10(rb$m),pch=20,col="darkgrey")
+  md <- loess(log10(rb$m)~rb$fraction,surface = "direct" ,span=0.5) 
+  points(md$x,md$fitted,type="l",col = 2,lwd=2)  
+  md_1 <- loess(log10(rb$q1)~rb$fraction,surface = "direct" ,span=0.5) 
+  points(md_1$x,md_1$fitted,type="l",col = 3)  
+  md_2 <- loess(log10(rb$q2)~rb$fraction,surface = "direct" ,span=0.5) 
+  points(md_2$x,md_2$fitted,type="l",col = 3) 
+  
+  qs <- quantile(md$fitted[order(md$x)],na.rm = T)
+  axis(4,at=qs,labels = paste(round((10^qs)/1000),"kD"),4,las=2,cex=0.5)
+  abline(h=qs,lty=c(3,2,1,2,3)) 
+  dev.off()
+  system("open Bootstrap_SmoothScatter_SEC.pdf")
+  MeltDataSpecific <<- 
+  gp <- ggplot(data = MeltDataSpecific, aes(V1, log10(as.numeric(MW_ENSP)))) +   stat_density2d(aes(fill = ..density..^0.5), geom = "tile", contour = FALSE, n = 300) +   scale_fill_continuous(low = "white", high = "darkblue")+theme(legend.position = "none")+xlab("Fractions")+ylab("log10 Protein MW")+
+    annotate("line",md$x,md$fitted,color="red")+annotate("line",md_1$x,md_1$fitted,color="skyblue",lty="dotted")+annotate("line",md_2$x,md_2$fitted,color="skyblue",lty="dotted")+geom_hline(yintercept = qs,lty=c("dotted","dashed","solid","dashed","dotted"))+
+    annotate("text",x=max(md$x),y=qs,label=paste(round(10^(qs)/1000),"kD"),vjust=-1)
+  
+  
+  list(md=md,hi=md_1,lo=md_2,data=MeltDataSpecific,gg=gp)
+  
+  
+}
+
+Isofrac_PeakFinder <- function(it,ens_vector=NULL,randomized= F,inputSmall=inputSmall,pathAdd="./",clusterType="cl_2",BSrounds=10){
+  library(data.table)
+  library(ggplot2)
+  library(pracma)
+  library(parallel)
+  it <<- it 
+  randomized <<- randomized
+  pathAdd <<- pathAdd
+  cat("\r PeakFinder",it)
+  # ens <- "ENSG00000167193"# crk
+  ens <- ens_vector[it]
+  if(!randomized){
+    pathname <- paste(pathAdd,"PeakFinder",sep = "/")
+    try({
+      dir.create(pathname,showWarnings = F)
+      nam <- paste("PeakFinder_it",it,sep = "")
+      write(c(it,ens),paste(pathname,nam,sep = "/"))
+      
+    })
+  }else{
+    try({
+      pathname <- paste(pathAdd,"PeakFinder",sep = "/")
+      
+      dir.create(pathname,showWarnings = F)
+      nam <- paste("PeakFinder_it",it,sep = "")
+      write(c(it,ens),paste(pathname,nam,sep = "/"))
+      
+    })
+  }
+  
+  
+  # if(any(grepl(";",ens))){
+  #   return(NULL)
+  # }
+  PeaksEnsg <- list(Problem="Yes")
+  try({
+    # it <<- it
+    
+    # ens = "ENSG00000120802"
+    if(randomized){
+      sel <- inputSmall$dt_gn$ens==ens
+      if(all(!sel)){return(NULL)}
+      
+      hdbscanTable <- inputSmall$hdbscanTables_random[EnsG==ens]
+      dt <- inputSmall$TMTSubset_final_singlenorm_zscore[hdbscanTable$id,]
+      sel2 <- rep(T,dim(dt)[1])
+      
+      # sel2 <- hdbscanTable$FDR_RF< 0.05
+      # sel2[is.na(sel2)] <- F
+      
+    }else{
+      sel <- inputSmall$dt_gn$ens==ens
+      sel[is.na(sel)] <- F
+      if(all(!sel)){return(NULL)}
+      dt <- inputSmall$TMTSubset_final_singlenorm_zscore[sel,]
+      hdbscanTable <- inputSmall$hdbscanTables[EnsG==ens,]
+      
+      hdbscanTable <- hdbscanTable[match(inputSmall$InputTable$Sequence[sel],hdbscanTable$Seq)]# what is the purpose of this line?
+      # dt <- dt[match(inputSmall$InputTable$Sequence[sel],hdbscanTable$Seq)]# what is the purpose of this line?
+      
+      if(length(hdbscanTable$FDR_RF)==0){
+        hdbscanTable$FDR_RF <- 0
+      }
+      hdbscanTable$FDR_RF[is.na(hdbscanTable$FDR_RF)]<-1
+      
+      sel2 <- hdbscanTable$FDR_RF<10 # switched off
+      sel2[is.na(sel2)] <- F 
+    }
+    
+    # plot(Gpplot_LineTraces(dt[sel2,],applyhdbclust = F))
+    if(all(!sel2)){return(NULL)}
+    
+    library(pracma)
+    
+    hdbscanTable2 <- hdbscanTable#[sel2,]# FDR Control, but not used anymore
+    dt2 <- dt#[sel2,]
+    if(clusterType=="cl_2"){
+      hdbscanTable2$cl_2[is.na(hdbscanTable2$cl_2)] <- -1
+      cls <- setdiff(unique(hdbscanTable2$cl_2),c(0,-1))
+      hdbscanTable2$UsedClusters <- hdbscanTable2$cl_2
+      
+    }else{
+      hdbscanTable2$cl_3[is.na(hdbscanTable2$cl_3)] <- -1
+      cls <- setdiff(unique(hdbscanTable2$cl_3),c(0,-1))
+      hdbscanTable2$UsedClusters <- hdbscanTable2$cl_3
+      
+    }
+    
+    if(length(cls)==0){
+      return(1)
+    }
+    # clusterExport(cl,c("dt2","hdbscanTable2"))
+    PeaksEnsglist <- lapply(sort(cls),function(clsi){
+      cat("\r",clsi)
+      clsi <<- clsi
+      temp <- dt2[hdbscanTable2$UsedClusters==clsi,]
+      
+      
+      TempMean2 <- sapply(1:20,function(x){
+        TempMean <- apply(temp[sample(1:dim(temp)[1],replace = T),],2,median,na.rm = T)
+        TempMean
+      })
+      TempMean <- t(TempMean2)
+      TempMeanSmooth <- apply(TempMean,2,median,na.rm = T)
+      
+      TempMeanSd <- apply(TempMean2,2,function(x){sd(x,na.rm=T)})
+      
+      # TempMean <- apply(temp,2,median,na.rm = T)
+      # TempMeanSmooth <- savgol(TempMean,11,forder= 4,dorder=0)
+      
+      fp <- data.table(findpeaks(TempMeanSmooth,nups = 1,ndowns = 1,threshold = 0.1))
+      if(dim(fp)[1]==0){
+        return(NULL)
+      }
+      # fp2 <- data.table(findpeaks(TempMean,nups = 1,ndowns = 1))
+      fp$smooth <- F
+      # fp2$smooth <- F
+      
+      colnames(fp) <- c("Height","Peak","Start","End","Smooth")
+      fp[,c("StartDiff","EndDiff","PeakSD"):={
+        gr <- .BY
+        f1 <- TempMeanSmooth[(.BY$Peak-1):.BY$Start]
+        f2 <- TempMeanSmooth[(.BY$Peak+1):.BY$End]
+        f1.1 <<- .BY$Height-mean(f1,na.rm = T)
+        f2.2 <<- .BY$Height-mean(f2,na.rm = T)
+        
+        list(f1.1,f2.2,mean(TempMeanSd[.BY$Start:.BY$End],na.rm=T))
+        
+      },.(Height,Peak,Start,End,Smooth)]
+      qcutof <-quantile(unlist(temp),c(0.05,0.1,0.15,0.2),na.rm = T)
+      fp$Q0p5CutOff <- qcutof[1]
+      fp$Q1CutOff <- qcutof[2]
+      fp$Q1p5CutOff <- qcutof[3]
+      fp$Q2CutOff <- qcutof[4]
+      
+      fp$Median <- median(unlist(temp),na.rm = T)
+      
+      
+      colorder <- colnames(fp)
+      # fp <- fp[,{
+      #   temp <- .SD
+      #   temp$mpw <- NULL
+      #   data.frame(unique(temp),mpw =max(mpw,na.rm = T))
+      #   
+      # },Peak]
+      setcolorder(fp,colorder)
+      if(length(fp)==0){return(NULL)}
+      col <- rainbow(dim(fp)[1],alpha = 0.5)
+      # sapply(1:dim(fp)[1],function(it){
+      #   x <- fp[it,]
+      #   polygon(c(x[3],x[4],x[4],x[3]),c(rep(-2,2),rep(2,2)),col = col[it],border = NA)
+      #   NULL
+      # })
+      if(length(fp)>0){
+        # plot(TempMeanSmooth,type ="l")
+        # apply(temp,1,function(x){
+        #   points(x,type="l")
+        # })
+        
+        col <- rainbow(dim(fp)[1],alpha = 0.2,v=0.8)
+        plotstuffSet <- F
+        if(plotstuffSet){
+          plot(TempMeanSmooth,type ="l")
+          apply(temp,1,function(x){
+            points(x,type="l")
+          })
+        }
+        
+        
+        Peaks <- sapply(1:dim(fp)[1],function(it,plotstuff=plotstuffSet){
+          it <<- it
+          PositionTable <- rep(NA,9)
+          ({
+            x <- unlist(fp[it,])
+            if(plotstuff){
+              polygon(c(x[3],x[4],x[4],x[3]),c(rep(-2,2),rep(2,2)),col = col[it],border = NA)
+              abline(v=x[2],lty = "dotted",col=purecol<- gsub("..$","",col[it]),lwd = 2)
+            }
+            
+            
+            # if(diff(c(x[2:3]))>1){
+            #   correct <- 1
+            # }else{
+            #   correct <- 0
+            # }
+            
+            
+            # LM from the left
+            
+            lm_1 <- lm_checker(x[3],x[2],temp)
+            lm_2 <- lm_checker(x[2],x[4],temp,cutatstart = F)
+            
+            CoefReal <- lmIntx(lm_1$md,lm_2$md)
+            # cl2 <- makeCluster(5)
+            
+            # clusterExport(cl2,c("temp","lm_checker","x","rbindlist","lmIntx"))
+            # print("BOOTSTRAP")
+            lm_bs <- sapply(1:BSrounds,function(it){
+              # cat("\r",it)
+              lm_1 <- lm_checker(x[3],x[2],temp,bootstrap = T)
+              lm_2 <- lm_checker(x[2],x[4],temp,bootstrap = T,cutatstart = F)
+              if(is.na(lm_1$md$coefficients[2])|is.na(lm_2$md$coefficients[2])){
+                CoefReal <- data.frame(x=NA,y=NA)
+              }else{ 
+                CoefReal <- lmIntx(lm_1$md,lm_2$md)
+              }
+              
+              unlist(CoefReal)
+            })
+            quantile_80 <- apply(lm_bs,1,quantile,probs=c(0.1,0.9),na.rm = T)
+            sd_80 <- apply(lm_bs,1,function(x){sd(x,na.rm=T)})
+            
+            PositionTable <- cbind(CoefReal,t(as.matrix(as.vector(quantile_80))),lm_1$n,t(as.matrix(as.vector(sd_80))))
+            names(PositionTable) <- c("Fraction_lm","Height_lm","Fraction_BS_lo","Fraction_BS_hi","Height_BS_lo","Height_BS_hi","n","Fraction_sd_80","Height_sd_80")
+            PositionTable$Fraction_width <- diff(c(PositionTable$Fraction_BS_lo,PositionTable$Fraction_BS_hi))
+            PositionTable$Height_width <- diff(c(PositionTable$Height_BS_lo,PositionTable$Height_BS_hi))
+            
+            
+          })
+          
+          # c(x,xout,yout,xout_all,yout_all,xsd=NA,ysd=NA,xsd_all=NA,ysd_all=NA,coefs)
+          
+          
+          cbind(t(as.matrix(x)),PositionTable)
+          
+        })
+        
+        print("DONE")
+        Peaks <- t(Peaks)
+        Peaks <- data.frame(Peaks)
+        
+      }else{return(NULL)}
+      Peaks$cluster2 <- clsi
+      Peaks
+    })
+    print("Combining")
+    PeaksEnsglist2 <<- PeaksEnsglist
+    print(lengths(PeaksEnsglist))
+    PeaksEnsg <- rbindlist(PeaksEnsglist)
+    PeaksEnsg$ENS <- ens
+  })
+  PeaksEnsg
+}
+lmIntx <- function(fit1, fit2, rnd=2) {
+  
+  b1<- fit1$coefficient[1]  #y-int for fit1
+  m1<- fit1$coefficient[2]  #slope for fit1
+  b2<- fit2$coefficient[1]  #y-int for fit2
+  m2<- fit2$coefficient[2]  #slope for fit2
+  df <- data.frame(x=NA, y=NA)
+  
+  if(m1==m2 & b1==b2) {print("Lines are identical")
+  } else if(m1==m2 & b1 != b2) {print("Lines are parallel")
+  } else {
+    x <- (b2-b1)/(m1-m2)      #solved general equation for x
+    y <- m1*x + b1            #plug in the result
+    df <- data.frame(x=round(x, rnd), y=round(y, rnd))
+  }
+  df
+}
+lm_checker <- function(start,end,df,bootstrap=F,rangeCutoff = 3,cutatstart=T,ggplotstuff=F){
+ 
+  x1 <- start:end
+  if(cutatstart){
+    if(diff(range(x1))>rangeCutoff){
+      x1 <- (start+rangeCutoff-1):end
+    }
+  }else{
+    if(diff(range(x1))>rangeCutoff){
+      x1 <- (start):(end-rangeCutoff+1)
+    }
+  }
+  
+  
+  # x1 <- start:end
+  x1_all <- lapply(x1,function(itx){
+    data.frame(itx,data.frame(df)[,itx])
+  })
+  x_all <- lapply(1:dim(df)[2],function(itx){
+    data.frame(itx,data.frame(df)[,itx])
+  })
+  x_all <- rbindlist(x_all)
+  x1_all <- rbindlist(x1_all)
+  if(bootstrap){
+    s <- sample(1:dim(x1_all)[1],replace = T)
+    lm_md <- lm(as.numeric(unlist(x1_all[s,2]))~as.numeric(unlist(x1_all[s,1])))
+  }else{
+    lm_md <- lm(as.numeric(unlist(x1_all[,2]))~as.numeric(unlist(x1_all[,1])))
+  }
+  names(x_all) <- c("V1","V2")
+  names(x1_all) <- c("V1","V2")
+  
+  # plotting
+  g <- NA
+  try({
+    coef <- coefficients(lm_md)
+    g <- ggplot(x_all,aes(V1,V2))+geom_point()+geom_abline(slope=coef[2],intercept = coef[1])+geom_vline(xintercept = range(x1),lty= "dotted")
+    if(ggplotstuff){
+      print(g)
+    }
+  })
+  # 
+  
+  list(md=lm_md,x1_all=x1_all,g=g,n=dim(x1_all)[1])
+}
+
+IsoFrac_Compiler.DIANN <- function(ori,# long list table from DIANN containing a column with the assigend Fractions
+                                   threads=5,fillNA=-1,MD=NULL){
+  if(all(names(ori)!="Fraction")){
+    warning("Please add a Fraction column to the ori table")
+    return(NULL)
+  }
+  
+  if(any(is.na(ori$Fraction))){
+    
+    warning(paste("NAs detected in the Fraction column. Analysis might be compromised. NAs:",sum(is.na(ori$Fraction))))
+    return(NULL)
+  }
+  
+  
+  
+  cat("\r","addind Measures\n")
+  ori[,GeneSummed:=sum(Ms1.Area,na.rm=T),Genes]
+  ori[,Count:=length(Ms1.Area),Genes]
+  
+  
+  if(length(MD)==0){
+    MD <- MW_Trace(ori,UNIPROTKB)$md
+  }
+  
+  print("Step2 Clustering and Peaks Identification")
+  
+  library(parallel)
+  cat("\r","Initiating Cluster\n")
+  cl <- makeCluster(threads)
+  cat("\r","Preparing Cluster\n")
+  clusterExport(cl,"")
+  
+  Genes <- unique(ori$Genes)
+  Genes <- Genes[Genes!=""]
+  Genes <- Genes[!is.na(Genes)]
+  g="cRAP−AHSG"
+  parLapply(Genes,IsoFrac_PeakfinderWrapper)
+  
+  
+  
+  
+  
+  
+}
+
+IsoFrac_PeakfinderWrapper <- function(ori,g,quantification="Precursor.Normalised",MD=NULL){
+  library(dbscan)
+  
+  o <- ori[g==Genes]
+  # Dbscan Clsutering
+  # First Clustering
+  o$Fraction <- factor(o$Fraction,min(o$Fraction,na.rm=T):max(o$Fraction,na.rm=T))
+  om <- dcast(o,Stripped.Sequence~Fraction,value.var =quantification,fun.aggregate = sum,fill = NA,drop = c(FALSE,TRUE) )
+  # om <- scale(t(om))
+  omse <- om$Stripped.Sequence
+  om$Stripped.Sequence <- NULL
+  om$`NA` <- NULL
+  om<- data.table(t(scale(t(om))))
+  om[is.na(om)] <- rnorm(sum(is.na(om)),-0.5,0.01)
+  # Second Lelel Clustering
+  if(dim(om)[1]>200){
+    
+    o$cl <- "grey22"
+  }else{
+    o$cl <- "grey22"
+    try({ hdbresult <- hdbscan(apply(om,2,function(x){x[is.na(x)] <- 0;as.numeric(x)} ),2)})
+    try({ hdbresult3 <- hdbscan(apply(om,2,function(x){x[is.na(x)] <- 0;as.numeric(x)} ),3)})
+    
+    try({o$cl <- hdbresult$cluster[match(o$Modified.Sequence,omse)]})
+  }
+  cat("\r","Peak Finding \n")
+  
+  inputSmall <- list()
+  
+  inputSmall$hdbscanTables_random <- NULL
+  inputSmall$hdbscanTables <-  data.table(EnsG="ENSGtemp",cl_2 = hdbresult$cluster,cl_3=hdbresult3$cluster,cl_2_nf   =hdbresult$cluster,Seq=omse)
+  inputSmall$TMTSubset_final_singlenorm_zscore <- om
+  inputSmall$dt_gn <- data.table(hgnc_symbol="temp",gn="temp",ens="ENSGtemp",UniAccession="temp",seq=omse,Use=T,ens_original="TEMP",ens_Count=1)
+  
+  inputSmall$InputTable <- data.frame(Sequence=omse)
+  ens_vector <- unique(inputSmall$dt_gn $ens)
+  huha <- Isofrac_PeakFinder(1,inputSmall=inputSmall,pathAdd = "./",randomized = F,ens_vector=ens_vector,BSrounds = 10)
+  huha$Peak_MW <- predict(MD$md,unlist(huha$Peak)+min((as.numeric(names(om))))-1)
+  huha$End_MW <- predict(MD$md,unlist(huha$Start)+min((as.numeric(names(om))))-1)
+  huha$Start_MW <- predict(MD$md,unlist(huha$End)+min((as.numeric(names(om))))-1)
+  huha$MW_lm <- predict(MD$md,unlist(huha$Fraction_lm)+min((as.numeric(names(om))))-1)
+  huha$MW_fr_gel_hi <- predict(MD$lo,unlist(huha$Fraction_lm)+min((as.numeric(names(om))))-1)
+  huha$MW_lm_gel_lo <- predict(MD$hi,unlist(huha$Fraction_lm)+min((as.numeric(names(om))))-1)
+  
+  
+  
+  o$cl[is.na(o$cl)] <- "grey22"
+  
+  om_melt_prepar <- om
+  om_melt_prepar$sequence <- omse
+  om_melt_prepar$cl <- hdbresult$cluster
+  om_melt <- melt(om_melt_prepar,measure.vars =names(om) )
+  om_melt$MW <- predict(MD$md,om_melt$variable)
+  
+  
+  print("Complexity Reduction:")
+  huha$PeakfinderSet <- "cl_2" # option to run multiple peakfinders with different Clustering Events
+  ipr_compressed <- Compression_Function_ForDT(huha)
+  ipr_PeakIdentity <- ipr_compressed[,{
+    # cat("\r",.BY$ENS)
+    temp <- .SD
+    temp$id <- 1:dim(temp)[1]
+    
+    temp$Compressed_MW_Variants <- temp$MW_lm
+    temp
+    
+  },.(ENS,PeakfinderSet)]
+  
+  
+ 
+  
+  
+  list(Traces=om_melt,Peaks=huha,Peaks_Compressed=ipr_PeakIdentity)
+  
+  
+}
+
+plot_traces <- function(input,lwd=NULL){
+  
+   gg <- ggplot(input$Traces,aes(10^MW,value,group=sequence,color=as.character(cl)))+geom_line()+annotate("text",unlist(10^input$Peaks_Compressed$MW_lm),unlist(input$Peaks_Compressed$Height_lm),label=paste("==> ",round(10^input$Peaks_Compressed$MW_lm/1000),"kD <==",sep=""))
+}
+
+Compression_Function_ForDT <- function(x,zscoreCutoff=1,FractionCutoff=10,PeakScore_DL_Cutoff =0.1,safety_width=2500){
+  
+  library(data.table)
+  {
+    # cat("\r",.GRP)
+    temp <- as.data.table(x)
+    if(all(temp$Height<=max(zscoreCutoff))){
+      temp$ZscoreClass <- min(zscoreCutoff)
+    }else{
+      temp$ZscoreClass <- max(zscoreCutoff)
+      
+    }
+    
+    temp <- temp[order(unlist(Height),decreasing = T)]
+    temp$Selection <- 1
+    temp$id <- 0
+    id<- 1
+    moveon <- T
+    temp$CandidateID <- 1:dim(temp)[1]
+    temp$hierarchie <- 0
+    Candidates <- temp
+    it <- 0
+    while(any(as.logical(temp$Selection))&moveon){
+      it <- it+1
+      
+      # Current Selection
+      tempsel <- temp[Selection==1&!is.na(match(temp$CandidateID,Candidates$CandidateID))][1,]
+      
+      # Checking same fraction
+      if(any(sel <-( 10^tempsel$Start_MW-safety_width)<=(10^Candidates$Peak_MW)&(10^tempsel$End_MW+safety_width)>=(10^Candidates$Peak_MW))
+         |any(sel <-( 10^Candidates$Start_MW-safety_width)<=(10^tempsel$Peak_MW)&(10^Candidates$End_MW+safety_width)>=(10^tempsel$Peak_MW))
+      ){
+        
+        PeakTestingResults <- PeakTesting(tempsel,temp,Candidates)
+        
+        Selection <- PeakTestingResults$SimilarityIndex[V1==TRUE]$ID
+        if(length(Selection)>0){
+          sel[is.na(match(Candidates$CandidateID,Selection))] <- F
+        }
+        # Setting Selection to main Peak
+        temp$hierarchie[temp$CandidateID==tempsel$CandidateID] <- 1
+        # Defining ID of minor peaks
+        temp[match(Candidates$CandidateID[sel],CandidateID)]$id <- tempsel$CandidateID
+        temp[match(Candidates$CandidateID[sel],CandidateID)]$Selection <- 0
+      
+        Candidates <- Candidates[is.na(match(Candidates$CandidateID,temp$CandidateID[temp$Selection==0])),]
+      }
+      # Checking adjacent Fractions within Peak Boundaries
+      
+      
+      
+      if(dim(Candidates)[1]>0&it<=dim(Candidates)[1]){
+        moveon <- T
+      }else{
+        moveon <- F
+      }
+      
+    }
+    temp$UsedClusters
+    tempBackup <- temp
+    temp <- tempBackup
+    temp[,c("clusters","UsedClustersGroup","gels","heights","Peaks_collapse","n_Peaks"):={
+      te <- .SD
+      list(paste(te$cluster2,collapse=";"),
+           paste(te$UsedClusters,collapse=";"),
+           paste(te$gel,collapse=";"),
+           paste(te$Height,collapse=";"),
+           paste(te$Peak,collapse=";"),
+           length(unique(te$cluster2)))
+    },id]
+    # print(dim(temp))
+    (  temp[hierarchie==1,])
+    
+  }
+}
+### Enrichment 
+hyper_equal_or_more <- function(x,m,n,k){
+  dhyper(x,m,n,k) + phyper(x,m,n,k,lower.tail=F)
+}
+EnrichmentFunction <- function(Target,Candidate,ProteinPeptideMappings){
+  # Target <<- Target
+  # Candidate <<- Candidate
+  UniProt <- ProteinPeptideMappings[ID==Target]
+  Isofrac <- ProteinPeptideMappings[Compressed_MW_Variants==Candidate]
+  
+  
+  Uniprot_Peptides <- (UniProt[ID==Target]$Peptide)
+  Isofrac_Peptides            <-  (unique(Isofrac$Peptide))
+  allBalls <- c(unique(ProteinPeptideMappings$Peptide),"noiseadd")
+  
+  PickedWhite <- unique(intersect(Isofrac_Peptides,Uniprot_Peptides))
+  PickedIsofrac <- unique(intersect(Uniprot_Peptides,Isofrac_Peptides))
+  
+  AllWhite <- unique(Uniprot_Peptides)
+  blackBalls <- unique(setdiff(allBalls,Uniprot_Peptides))
+  
+  
+  p <- hyper_equal_or_more(x=length(PickedWhite),#whitballs picked from the urn
+                           m=length(AllWhite),# number of white balls
+                           n= length(blackBalls),# number of black balls
+                           k=length(Isofrac_Peptides))# total number drawn from the urn)
+  
+  o <- list(p,
+            length(PickedWhite),#whitballs picked from the urn
+            length(AllWhite),# number of white balls
+            length(blackBalls),# number of black balls
+            length(PickedWhite)/length(Isofrac),# Overlap Uniprot / Number of Isofrac,
+            length(PickedIsofrac)/length(AllWhite),# Overlap Isofrac / Number of Uniprot,
+            
+            length(allBalls)
+  )
+}
+```
+
+
+## MW Traces
+
+```{r}
+library(seqinr)
+library(Peptides)
+if(!exists("HSdt")){
+  HS <- read.fasta(FastaPath,seqtype = "AA",as.string = T)
+  
+  HSdt <- data.table(ID=names(HS),Sequence=unlist(HS))
+  options(warn=-1)
+  HSdt[,MW:=mw(.BY$Sequence),Sequence]
+  IDsplit <- strsplit(HSdt$ID,"|",fixed=T)
+  HSdt$IDclean <- sapply(IDsplit,"[[",2)
+  UNIPROTKB <- HSdt
+  ori <- CompiledTable_list[[1]]$Original[Ms1.Area>5000&Q.Value<0.01]# Generate the Model on first entry
+
+  MD <- MW_Trace(ori,HSdt,bs_rounds=50,FractionCutoff = c(1,10000)) 
+
+}
+
+```
+
+
+## Peakfinder Parallelized
+
+```{r}
+library(parallel)
+threads <- 40
+cl <- makeCluster(threads)
+
+ori <- CompiledTable_list[[1]] # pick the reference Experiment
+
+genes <- unique(ori$Genes)
+genes <- genes[genes!=""]
+clusterExport(cl,c("MD","PeakTesting","ori","Isofrac_PeakFinder","lmIntx","lm_checker","IsoFrac_Compiler.DIANN","IsoFrac_PeakfinderWrapper","Compression_Function_ForDT"))
+# clusterExport(cl,c("PeakTesting","Isofrac_PeakFinder","lmIntx","lm_checker","IsoFrac_Compiler.DIANN","IsoFrac_PeakfinderWrapper","Compression_Function_ForDT"))
+clusterExport(cl,c("ori"))
+
+dir.create("IsoFrac_Temp")
+
+
+
+Isoform_List <- parLapply(cl,genes,function(x){
+  library(data.table)
+  library(ggplot2)
+  resi.ms1 <- list()
+  resi.ms2 <- list()
+  resi.ms12 <- list()
+  resi.ms1area <- list()
+  try({
+    ori.temp <- ori[Genes==x]
+    ori.temp <- ori.temp[,ms12:={(Ms1.Area/sum(Ms1.Area,na.rm=T))+(Precursor.Quantity/sum(Precursor.Quantity,na.rm=T))},Stripped.Sequence]
+    try({resi.ms12<- IsoFrac_PeakfinderWrapper(ori.temp[Lib.Q.Value<0.01&Translated.Q.Value<0.1&Fraction>5&Fraction<35],x,quantification = "ms12",MD=MD)})
+
+
+    save(resi.ms1,resi.ms2,resi.ms12,file=paste("./IsoFrac_Temp",paste(make.names(x),".rda",sep=""),sep="/"))
+
+})
+    NULL
+})
+  
+
+GeneLists <- lapply(lifina <- list.files("./IsoFrac_Temp",pattern="rda$",full.names = T),function(x){
+  x <<-x 
+  hu <- load(x)
+  if(length(resi.ms1)==0&length(resi.ms2)==0&length(resi.ms12)==0){
+    return(NULL)
+  }else{
+    return(
+        list(ms1=resi.ms1,ms2=resi.ms2,ms12=resi.ms12,gene=x) 
+
+    )
+  }
+
+
+    
+
+})
+
+names(GeneLists) <-gsub(".rda$","", basename(lifina))
+
+GeneLists <- GeneLists[lengths(GeneLists)>0]
+
+GeneLists <- lapply(1:length(GeneLists),function(it){
+    x <- GeneLists[[it]]
+
+    x$hgnc <- names(GeneLists)[it]
+    x
+
+})
+
+IsoFormTable <- lapply(1:length(GeneLists),function(it){
+  x <- GeneLists[[it]]
+  temp <- x$ms12$Peaks_Compressed
+  temp$hgnc <- names(GeneLists)[it]
+  temp
+
+})
+IsoFormTable <- rbindlist(IsoFormTable[lengths(IsoFormTable)>1],fill=T)
+
+IF <- IsoFormTable[unlist(Height_lm)>1,length(unique(unlist(Compressed_MW_Variants))),hgnc]
+EvidencesPerGene <- ggplot(IF[,.(Counts=length(unique(hgnc))),V1],aes(V1,Counts))+geom_bar(stat="identity")+ggtitle(paste(length(unique(IF$hgnc)),"Genes",sum(IF$V1),"Isoforms"))+xlab("Isoform Evidences per Gene")
+
+plot(EvidencesPerGene)
+
+```
+
+## Closest Protein Assessment
+
+```{r}
+# Extracting Informations
+
+clusterExport(cl,c("HSdt","EnrichmentFunction","hyper_equal_or_more"))
+IsoForm_Peptides <- parLapply(cl,GeneLists,function(x){
+  library(data.table)
+  x <- x
+  cat("\r",x$gene)
+  temp <- x$ms12$Peaks_Compressed
+  if(length(temp)==0){
+    return(NULL)
+  }
+  temp$hgnc <- x$gene
+  if(dim(temp)[1]==1){
+    nam <- names(temp)
+    temp <- apply(temp,2,unlist)
+    temp <- t(temp)
+    temp <- data.table(temp)
+    names(temp) <- nam
+
+  }else{
+    temp <- apply(temp,2,unlist)
+
+  }
+  temp <- data.table(temp)
+  Peptides <- temp[,.(Peptide={
+     x$ms12$Traces[cl==.BY$cluster2]$sequence
+  }),names(temp)]
+  Peptides$Gene <- x$gene
+  ProteinGreps <- Peptides[,{
+    HSdt[grep(.BY$Peptide,Sequence,fixed=T)]
+    
+  },Peptide]
+  ProteinPeptideMappings <- Peptides[,ProteinGreps[!is.na(match(ProteinGreps$Peptide,.BY$Peptide))],.(Peptide,Compressed_MW_Variants)]
+  ProteinPeptideMappings[,{
+    EnrichmentFunction(.BY$ID,.BY$Compressed_MW_Variants,ProteinPeptideMappings)
+  },.(Compressed_MW_Variants,MW,ID)]
+})
+
+
+IsoForm_PeptidesDT <- rbindlist(IsoForm_Peptides)
+save(IsoForm_PeptidesDT,file="IsoForm_PeptidesDT.rda")
+IsoForm_PeptidesDT[,DM:=10^as.numeric(Compressed_MW_Variants)-as.numeric(MW)]
+ISO <- IsoForm_PeptidesDT[,{temp <- .SD[V1==min(V1)];
+                              temp[DM==min(DM)]
+                                        
+                                   
+                                        },Compressed_MW_Variants]
+
+ISO$type <- "Score DM"
+ISO_Random <- IsoForm_PeptidesDT[,{.SD[sample(V1,1)==V1][1,]},Compressed_MW_Variants]
+ISO_Random$type <- "Random" 
+
+
+ISOALL <- rbind(ISO,ISO_Random)
+table(ISOALL$type)
+smoothScatter(as.numeric(ISO$Compressed_MW_Variants),log10(as.numeric(ISO$MW)),xlim=c(3,6))
+abline(0,1)
+PlotCollecter$MW_UPvsSF <- ggplot(ISO,aes(as.numeric(Compressed_MW_Variants),log10(as.numeric(MW))))+geom_bin_2d(bins=100)+geom_abline(slope=1,intercept = 0,color="orange",lwd=2,alpha=0.5,lty="dotted")+xlab("SecFrac MW [log10]")+ylab("UniProt MW [log10]")
+PlotCollecter$MW_UPvsSF_Density <- ggplot(ISOALL,aes(DM,color=type))+geom_density(bw=0.0000001,span=0.00000001)+xlab("Delta Mass IsoFrac SEC - UP [MW]")+coord_cartesian(xlim=c(-200000,200000))
+
+```
+
+
+### Plotting Single Reference Proteins:
+
+```{r}
+plot_traces <- function(input,lwd=NULL,removeZeroCl=F,AverageCluster=F,smooth=F){
+  inputfinal <- input$Traces
+  if(removeZeroCl){
+      inputfinal <- input$Traces[cl!=0]
+
+  }
+  if(AverageCluster){
+    inputfinal <<- inputfinal
+    inputfinal <- inputfinal[,{list(value=median(value,na.rm=T),sequence=.BY$cl)},.(cl,variable,MW)]
+      gg <- ggplot(inputfinal,aes(10^MW,value,group=sequence,color=as.character(cl)))+geom_line(lwd=lwd)+annotate("text",unlist(10^input$Peaks_Compressed$MW_lm),unlist(input$Peaks_Compressed$Height_lm),label=paste("==> ",round(10^input$Peaks_Compressed$MW_lm/1000),"kD <==",sep=""))
+  }else{
+    if(smooth){
+            gg <- ggplot(inputfinal,aes(10^MW,value,group=cl,color=as.character(cl)))+geom_smooth(span=0.5)+annotate("text",unlist(10^input$Peaks_Compressed$MW_lm),unlist(input$Peaks_Compressed$Height_lm),label=paste("==> ",round(10^input$Peaks_Compressed$MW_lm/1000),"kD <==",sep=""))
+
+    }else{
+      gg <- ggplot(inputfinal,aes(10^MW,value,group=sequence,color=as.character(cl)))+geom_line(lwd=lwd)+annotate("text",unlist(10^input$Peaks_Compressed$MW_lm),unlist(input$Peaks_Compressed$Height_lm),label=paste("==> ",round(10^input$Peaks_Compressed$MW_lm/1000),"kD <==",sep=""))
+
+    }
+  }
+   
+gg+ggtitle(input$gene)+ylab("zscore")+xlab("MW")
+}
+
+
+
+pdf("SEC_TMPO_EXAMPLE.pdf",width=15)
+plot_grid(plot_traces(GeneLists$TMPO$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = F)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("TMPO"),
+          plot_traces(GeneLists$TMPO$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = T)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("TMPO"))
+
+
+plot_grid(plot_traces(GeneLists$NFKB1$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = F)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("NFKB1"),
+          plot_traces(GeneLists$NFKB1$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = T)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("NFKB1"))
+
+plot_grid(plot_traces(GeneLists$VIM$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = F)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("VIM"),
+          plot_traces(GeneLists$VIM$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = T)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("VIM"))
+
+plot_grid(plot_traces(GeneLists$TEAD3$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = F)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("TEAD3"),
+          plot_traces(GeneLists$TEAD3$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = T)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("TEAD3"))
+
+plot_grid(plot_traces(GeneLists$IRS2$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = F)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("IRS2"),
+          plot_traces(GeneLists$IRS2$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = T)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("IRS2"))
+
+plot_grid(plot_traces(GeneLists$CRK$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = F)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("IRS2"),
+          plot_traces(GeneLists$IRS2$ms12,lwd=1,removeZeroCl=T,AverageCluster=F,smooth = T)+coord_cartesian(ylim=c(-1,2.5))+ggtitle("IRS2"))
+
+plot_traces(GeneLists$RABEP1$ms12,AverageCluster = F)
+
+dev.off()
+
+system("open SEC_TMPO_EXAMPLE.pdf")
+```
+
+```{r}
+graphics.off()
+pdf("PlotCollecter.pdf",width=6,height =5)
+
+lapply(PlotCollecter,function(x){
+  plot(x)
+})
+
+dev.off()
+system("open PlotCollecter.pdf")
+```
+

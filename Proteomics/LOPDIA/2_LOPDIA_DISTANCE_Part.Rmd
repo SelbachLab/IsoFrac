@@ -1,0 +1,707 @@
+---
+title: "LOPIT_Diostance_Part_2026"
+author: "Henrik Zauber"
+date: "2026-02-10"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# LOPDIA Isofrac Integration
+
+- requires IsoFrac_LOPIT.rda 
+
+## INitializations
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(parallel)
+dirpath <- dirname(rstudioapi::documentPath())
+setwd(dirpath )
+dir.create("ClusterResults")
+runDistance <- F
+load("./IsoFrac_LOPIT_20260408.rda")
+
+IsoFrac_LOPIT_clean <- IsoFrac_LOPIT[!is.na(PC1)]
+length(unique(IsoFrac_LOPIT_clean$hgnc_symbol))
+IsoFrac_LOPIT_clean[,IsoFrac_Group:=paste(unique(round(IsoFrac_MW)),collapse=";"),Seq]
+IsoFrac_LOPIT_clean[,IsoFrac_Group_n:=length(unique(IsoFrac_Group[!is.na(PC1)])),hgnc_symbol]
+IsoFrac_LOPIT_clean <- IsoFrac_LOPIT_clean[IsoFrac_Group_n>1]
+table(IsoFrac_LOPIT_clean$Uniprot_Isoform_Category)
+IsoFrac_LOPIT[hgnc_symbol=="CTSB"]$IsoFrac_Group_n
+
+```
+
+## Distance Calculations
+
+```{r}
+runDistance <- F
+if(runDistance){
+  library(ggplot2)
+library(data.table)
+library(parallel)
+setwd(dirpath <- "E:/MaxQuant/HZ/20220114_Isofrac_v2/REBUTTAL_Temp/")
+dir.create("ClusterResults")
+runDistance <- F
+load("./IsoFrac_LOPIT_20260408.rda")
+IsoFrac_LOPIT_clean <- IsoFrac_LOPIT[!is.na(PC1)]
+length(unique(IsoFrac_LOPIT_clean$hgnc_symbol))
+IsoFrac_LOPIT_clean[,IsoFrac_Group:=paste(unique(round(IsoFrac_MW)),collapse=";"),Seq]
+IsoFrac_LOPIT_clean[,IsoFrac_Group_n:=length(unique(IsoFrac_Group[!is.na(PC1)])),hgnc_symbol]
+IsoFrac_LOPIT_clean <- IsoFrac_LOPIT_clean[IsoFrac_Group_n>1]
+IsoFrac_LOPIT_clean[hgnc_symbol=="CTSB"]
+IsoFrac_LOPIT_clean[hgnc_symbol=="CSTB"]
+
+table(IsoFrac_LOPIT_clean$Uniprot_Isoform_Category)
+
+Distance_Function <- function(tempBackup,Scale_PCs=F,Randomize=F,PCgrepString="^PC[1-9]$"){
+  Distances <- NULL
+  try({
+    temp <- tempBackup
+    temp <- temp[!is.na(PC1)]
+    if(Randomize){
+      temp$IsoFrac_Group <- sample(temp$IsoFrac_Group)
+    }
+    
+    temp <- as.data.table(temp)
+    if(length(temp$IsoFrac_Group)==0){
+      stop("Please assign Isofrac groups.")
+    }
+    centroid <- function(X) colMeans(X, na.rm = TRUE)
+    
+    PCs <- temp[,.SD,.SDcols=grep(PCgrepString,names(temp)),by=.(IsoFrac_Group)]
+    
+    if(Scale_PCs){
+      IsfGr <- PCs$IsoFrac_Group
+      PCs$IsoFrac_Group <- NULL
+      PCs <- apply(PCs,2,scale)
+      PCs <- data.table(PCs)
+      PCs$IsoFrac_Group <- IsfGr
+    }
+    
+    # calculating all centroids
+    AllCentroids= PCs[,{
+      
+      PCstemp <- .SD[,.SD,.SDcols=grep(PCgrepString,names(.SD))]    
+      as.data.table(t(data.frame(centroid(PCstemp))))
+      
+    },.(IsoFrac_Group)]
+    
+    
+    Distances <- temp[,
+                      {
+                        ToOther_Distance <- NULL
+                        ({
+                          ThisCentroidName <- .BY$IsoFrac_Group
+                          gr <- .BY
+                          # Extract PC Matrix
+                          # Find current Centroid
+                          ThisCentroid <- AllCentroids[IsoFrac_Group==gr$IsoFrac_Group]
+                          ThisCentroid$IsoFrac_Group <- NULL
+                          # and other Centroids
+                          
+                          OtherCentroids <- AllCentroids[IsoFrac_Group!=gr$IsoFrac_Group]
+                          OtherCentroidsNames <- OtherCentroids$IsoFrac_Group
+                          OtherCentroids$IsoFrac_Group <- NULL
+                          
+                          # PCs
+                          PCs_selected <- PCs[gr$IsoFrac_Group==IsoFrac_Group]
+                          Peptides <- temp[gr$IsoFrac_Group==IsoFrac_Group]$Seq
+                          
+                          PCs_selected$IsoFrac_Group <- NULL
+                         
+                          # Distance Calculations per Sequence
+                          ToOther_Distance <- lapply(1:dim(PCs_selected)[1],function(it){
+                            xpeptide <- PCs_selected[it,]
+                            OtherCentroids_distances <- lapply(1:dim(OtherCentroids)[1],function(yit){
+                              y <- OtherCentroids[yit,]
+                              obs_dist <- sqrt(sum((xpeptide - y)^2))
+                              Centroid_Distance <- sqrt(sum((ThisCentroid - y)^2))
+                              data.table(obs_dist_toOther=obs_dist,Centroid_Distance=Centroid_Distance,ThisCentroidName=ThisCentroidName,ComparisonCentroidName=OtherCentroidsNames[yit])
+                            })
+                            OtherCentroids_distances <- rbindlist(OtherCentroids_distances)
+                            
+                            OtherCentroids_distances$obs_dist_within = sqrt(sum((xpeptide - ThisCentroid)^2))
+                            OtherCentroids_distances$Peptide = Peptides[it]
+                            OtherCentroids_distances
+                          })
+                          ToOther_Distance <- rbindlist(ToOther_Distance)
+                          
+                        })
+                        ToOther_Distance
+                      },
+                      .(IsoFrac_Group,IsoFrac_MW)]
+    
+   
+    
+    
+    if(1){
+      PCs <- PCs[,.SD,.SDcols = grep("^PC[123]$",names(PCs)),by=IsoFrac_Group]
+      library(MASS)
+      library(mvtnorm)
+      gr <- as.list(unique(temp$IsoFrac_Group))
+      names(gr) <- "IsoFrac_Group"
+      Overlap <- temp[,
+                      {
+                        ToOther_Distance <- NULL
+                        try({
+                          gr <- .BY
+                          ThisCentroidName <- .BY$IsoFrac_Group
+                          
+                          ThesePCs <- PCs[IsoFrac_Group==gr$IsoFrac_Group]
+                          OtherPCs <- PCs[IsoFrac_Group!=gr$IsoFrac_Group]
+                          
+                          # Extract PC Matrix
+                          
+                          Overlap_List <- lapply(1:length(unique(OtherPCs$IsoFrac_Group)),function(yit){
+                            PCcols <- grep("^PC", names(PCs), value = TRUE)
+                            
+                            A <- (OtherPCs[IsoFrac_Group == unique(OtherPCs$IsoFrac_Group)[yit],])
+                            A$IsoFrac_Group <- NULL
+                            B <- ThesePCs#(PCs[IsoFrac_Group == gr$IsoFrac_Group, ])
+                            B$IsoFrac_Group <- NULL
+                            muA <- colMeans(A)
+                            muB <- colMeans(B)
+                            
+                            SA <- cov(A)
+                            SB <- cov(B)
+                            
+                            # sample points
+                            n <- 10000
+                            XA <- mvrnorm(n, muA, SA)
+                            XB <- mvrnorm(n, muB, SB)
+                            
+                            # density evaluation
+                            dA <- dmvnorm(XA, muA, SA,log=T)
+                            dB <- dmvnorm(XA, muB, SB,log=T)
+                            
+                            overlap <- mean(exp(pmin(dA, dB) - dA))
+                            
+                            
+                            list(This_Centroid=gr$IsoFrac_Group,Other_Centroid=unique(OtherPCs$IsoFrac_Group)[yit],Overlap=overlap)
+                            
+                          })
+                          ToOther_Distance <- rbindlist(Overlap_List)
+                          
+                        })
+                        # print(ToOther_Distance)
+                        ToOther_Distance
+                      },
+                      .(IsoFrac_Group,IsoFrac_MW)]
+      Overlap <- Overlap[!is.na(Overlap)]
+      library(MASS)
+      Distances[,GroupOverlap:={
+        gr <- .BY
+        # prnt(gr)
+        # print(class(mahalanobisDistance))
+        
+        o1= Overlap[gr$ThisCentroidName==This_Centroid&
+                      Other_Centroid==gr$ComparisonCentroidName]$Overlap
+        o2= Overlap[gr$ThisCentroidName==This_Centroid&
+                      Other_Centroid==gr$ComparisonCentroidName]$Overlap
+        hu <- c(o1,o2)
+        hu <- hu[!is.na(hu)]
+        unique(hu)[1]
+        
+      },.(ThisCentroidName,ComparisonCentroidName)]
+      
+      
+      
+      
+      
+    }
+    
+    
+    
+    Distances <- unique(Distances)
+    Distances[,c("Average_within","Average_toOther"):={
+      list(mean(obs_dist_within,na.rm=T),
+           mean(obs_dist_toOther)
+      )
+      
+    },.(IsoFrac_MW,ComparisonCentroidName)]
+    Distances$hgnc_symbol <- temp$hgnc_symbol[1]
+    Distances$ENS <- temp$ENS[1]
+    
+    Distances$marker <- temp$Marker[1]
+    
+    Distances[,Wilcoxon_p:={
+      temp <- .SD
+      pout <- 1
+      try({
+        pout <- wilcox.test(log2(temp$obs_dist_toOther/temp$obs_dist_within),mu = 0,alternative = "greater")$p.value
+        
+      })
+      pout
+    },.(hgnc_symbol,IsoFrac_Group)]
+   
+    Distances$Mode <- paste(c("Randomize","Scale_PCs")[c(Randomize,Scale_PCs)],collapse="#")
+    
+  })    
+  Distances
+}
+
+
+cl <- makeCluster(20)
+clusterExport(cl,c("Distance_Function","dirpath"))
+IsoFrac_LOPIT_clean_split <- split(IsoFrac_LOPIT_clean,IsoFrac_LOPIT_clean$hgnc_symbol)
+# input
+li <- list.files(  paste(dirpath,"ClusterResults",sep="/"))
+missing <- which(is.na(match(names(IsoFrac_LOPIT_clean_split),basename(li))))
+
+IsoFrac_LOPIT_clean_split_subset <- IsoFrac_LOPIT_clean_split[missing]
+DistanceResults_list <- parLapply(cl,IsoFrac_LOPIT_clean_split_subset,function(input){
+  library(data.table)
+  outpath <- paste(dirpath,"ClusterResults",input$hgnc_symbol[1],sep="/")
+  if(!file.exists(outpath)){
+    DistanceCollect <- lapply(1:11,function(i){
+      cat("\r",i)
+      if(i==1){
+        Distance <- Distance_Function(input,F,F)
+      }else{
+        Distance <- Distance_Function(input,F,T)
+        
+      }
+      Distance$Iteration <- i
+      Distance
+      
+    })
+    DistanceCollect_dt <- rbindlist(DistanceCollect)
+    
+    save(DistanceCollect_dt,file=outpath)
+  }
+  
+  
+  NULL
+})
+stopCluster(cl)
+
+DistanceResults_dt <- rbindlist(DistanceResults_list,fill=T)
+ 
+}
+```
+
+##  Combing Results
+
+```{r}
+  li <- list.files("../REBUTTAL_Temp/ClusterResults/",full.names = T,recursive = T)
+  wd <- getwd()
+  library(parallel)
+  cl2 <- makeCluster(20)
+  clusterExport(cl2,"wd")
+  DistanceResults_list <- parLapply(cl2,li,function(x){
+    setwd(wd)
+    library(data.table)
+    cat("\r",x)
+    load(x)
+    if(length(DistanceCollect_dt$hgnc_symbol)==0){
+      DistanceCollect_dt$hgnc_symbol <- basename(x)
+    }
+    DistanceCollect_dt[,Wilcoxon_p:={
+      temp <- .SD
+      pout <- 1
+      try({
+        pout <- wilcox.test(log2(temp$obs_dist_toOther/temp$obs_dist_within),mu = 0,alternative = "greater")$p.value
+        
+      })
+      pout
+    },.(hgnc_symbol,IsoFrac_Group,Iteration)]
+    DistanceCollect_dt
+  })
+  stopCluster(cl2)
+  names(DistanceResults_list) <- basename(li)
+  
+  # Adding DeltaMass Information
+  DistanceResults_DT <- rbindlist(DistanceResults_list,fill=T)
+  DistanceResults_DT[,DeltaMass_Category_Fac:=paste(unique(IsoFrac_LOPIT[Seq==.BY$Peptide]$DeltaMass_Category_Fac),collapse=";"),Peptide]
+  save("DistanceResults_DT",file="DistanceResults_DT.rda")
+  
+```
+## Compressing to protein level
+
+```{r}
+
+
+  DistanceResults_DT <- DistanceResults_DT[!grepl(";",hgnc_symbol)]
+  DistanceResults_DT$Wilcoxon_p_BH <- p.adjust(DistanceResults_DT$Wilcoxon_p,"BH")
+  DistanceResults_DT[,IsoFrac_Group:=paste(unique(round(IsoFrac_MW)),collapse=";"),Peptide]
+  DistanceResults_DT[,IsoFrac_Group_n:=length(unique(IsoFrac_Group)),hgnc_symbol]
+  
+  IsoFrac_Lopit_Results_dt_proteins <- DistanceResults_DT[,{
+    temp <- .SD
+    #stop()
+    av <- log2(temp$obs_dist_toOther/temp$obs_dist_within)
+    temp <- .SD[av==median(av,na.rm=T)]
+    
+    .(Wilcoxon_p_mn=median(temp$Wilcoxon_p_BH,na.rm=T),
+      nPeps=length(unique(.SD$Peptide)),
+      Distance=median(av,na.rm=T))
+  },.(IsoFrac_MW,hgnc_symbol,DeltaMass_Category_Fac,Mode,Iteration,IsoFrac_Group)]
+  
+  IsoFrac_Lopit_Results_dt_proteins$Significant <- "not significant"
+  IsoFrac_Lopit_Results_dt_proteins[Wilcoxon_p_mn<0.01&nPeps>1]$Significant <- "adj.p < 0.01"
+  table(IsoFrac_Lopit_Results_dt_proteins$DeltaMass_Category_Fac)
+  
+
+  IsoFrac_Lopit_Results_dt_proteins$Condensed_DeltaMass_Category_Fac <- NULL
+  IsoFrac_Lopit_Results_dt_proteins$Condensed_DeltaMass_Category_Fac <- "Other"
+  IsoFrac_Lopit_Results_dt_proteins[DeltaMass_Category_Fac=="Processing"]$Condensed_DeltaMass_Category_Fac <- "UniProt Shorter Variants"
+  IsoFrac_Lopit_Results_dt_proteins[DeltaMass_Category_Fac=="Putative_Processing"]$Condensed_DeltaMass_Category_Fac <- "Shorter variant candidates"
+  table(IsoFrac_Lopit_Results_dt_proteins$Condensed_DeltaMass_Category_Fac)
+  IsoFrac_Lopit_Results_dt_proteins_counts <- IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode),.(Genes=length(unique(hgnc_symbol)),Isoforms=length(unique(paste(hgnc_symbol,IsoFrac_Group)))),.(Significant,Iteration,Condensed_DeltaMass_Category_Fac,Mode)]
+  IsoFrac_Lopit_Results_dt_proteins_counts_melt <- melt(IsoFrac_Lopit_Results_dt_proteins_counts,measure.vars = c("Genes","Isoforms"))
+  IsoFrac_Lopit_Results_dt_proteins_counts_melt$Distance <- 2
+  IsoFrac_Lopit_Results_dt_proteins_counts_melt[Mode=="Randomize"&Significant=="not significant"&Condensed_DeltaMass_Category_Fac=="Other"]
+  IsoFrac_Lopit_Results_dt_proteins_counts_melt <- IsoFrac_Lopit_Results_dt_proteins_counts_melt[,.(value=median(value)),.(variable,Distance,Mode,Condensed_DeltaMass_Category_Fac,Significant)]
+    IsoFrac_Lopit_Results_dt_proteins_counts_melt_v2 <- IsoFrac_Lopit_Results_dt_proteins_counts_melt[,.(value=median(value)),.(variable,Distance,Mode,Condensed_DeltaMass_Category_Fac)]
+  
+ 
+```
+
+## Distance Plots
+
+```{r}
+gbbp <- ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,Condensed_DeltaMass_Category_Fac,color=Mode))+geom_boxplot(orientation  ="y",outliers =F)+ylab("")+
+    xlab("Distance log2 FC Other/Within")+facet_wrap("Significant")+
+    geom_text(data=IsoFrac_Lopit_Results_dt_proteins_counts_melt[variable=="Isoforms"],aes(label=value),position = position_dodge(width = 0.5))
+
+
+ggDens <- ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,fill=Mode))+geom_density(alpha=0.9)+facet_grid("Condensed_DeltaMass_Category_Fac")+xlab("Distance log2 FC Other/Within")
+
+
+
+  plot(gbbp+theme(legend.position = "bottom"))
+  
+  pdf("LopitDistances.pdf",width=10)
+  plot(gbbp)
+  
+  ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,-log10(Wilcoxon_p_mn )))+geom_bin_2d(bins=100)+facet_grid(Condensed_DeltaMass_Category_Fac~Mode)
+  ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,fill=Mode))+geom_density(alpha=0.9)+facet_grid("Condensed_DeltaMass_Category_Fac")
+  ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,fill=Mode))+geom_density(alpha=0.9)+facet_grid(Condensed_DeltaMass_Category_Fac~Significant)
+  
+  
+  ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,DeltaMass_Category_Fac,color=Mode))+geom_boxplot(orientation  ="y",outliers =F)
+  ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,-log10(Wilcoxon_p_mn )))+geom_bin_2d(bins=100)+facet_grid(DeltaMass_Category_Fac~Mode)
+  ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,fill=Mode))+geom_density(alpha=0.9)+facet_grid("DeltaMass_Category_Fac")
+  ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,fill=Mode))+geom_density(alpha=0.9)+facet_grid(DeltaMass_Category_Fac~Significant)
+  
+  dev.off()
+  system("open LopitDistances.pdf")
+
+```
+
+## Functions
+```{r}
+  PC_Hull_Plot <- function(PCsubset){
+    PCsubset$IsoFrac_Group <- as.character(PCsubset$IsoFrac_Group)
+    p <- ggplot()
+    try({
+      p <- ggplot(PCsubset, aes(x = jitter(PC1), y = PC2, color = IsoFrac_Group,size=DeltaMass_Category_Fac)) +
+        geom_point(alpha=0.2) +
+        theme_minimal() +
+        labs(title = "2D Scatter Plot of Groups with Between-Group Distances")
+      hulls <- PCsubset[!is.na(PC1), .SD[chull(PC1, PC2)], by = IsoFrac_Group]
+      p <- p+geom_polygon(data = hulls,
+                          alpha = 0.2,color="transparent",aes(fill=IsoFrac_Group))
+    })
+    p#+theme(legend.position = "none")
+  }
+  library(cowplot)
+  PC_Centroid_Plot <- function(PCsubset){
+    G <- PCsubset$hgnc_symbol[1]
+    
+    PCsubset$IsoFrac_Group <- as.character(PCsubset$IsoFrac_Group)
+    PCsubset$IsoFrac_Group_num <- as.numeric(PCsubset$IsoFrac_Group)
+    
+    PCsubsetCentroid <- PCsubset[,.(PC1=mean(PC1),PC2=mean(PC2),PC1sd=sd(PC1),PC2sd=sd(PC2)),.(IsoFrac_Group,IsoFrac_Group_num,DeltaMass_Category_Fac)]
+    
+    # ensure the exact row order you want
+    setorder(PCsubsetCentroid, IsoFrac_Group_num)
+    PCA_Peptide_Centroid <- NULL
+    PCA_Peptide <- NULL
+    try({
+      PCA_Peptide_Centroid <- ggplot(PCsubset, aes(x = jitter(PC1), y = PC2, color = IsoFrac_Group))+geom_point()+geom_path(data=PCsubsetCentroid,aes(PC1,PC2,group=1))+
+        geom_point(data=PCsubsetCentroid,aes(size=IsoFrac_Group_num))
+      
+    })
+    
+    library(ggplot2)
+    try({
+      PCA_centroid <- ggplot(PCsubsetCentroid, aes(PC1, PC2,color=IsoFrac_Group, group = 1,pch=DeltaMass_Category_Fac)) +   # group=1 = single line
+        geom_path(color="grey",lwd=3) +                                        # respects row order
+        geom_point(aes(size=IsoFrac_Group_num),show.legend = F) +
+        geom_text(aes(label = IsoFrac_Group),show.legend = F, vjust = -0.5)+ggtitle(G)
+      
+    })
+    try({
+      PCA_hull <- ggplot(PCsubsetCentroid, aes(x = jitter(PC1), y = PC2, color = IsoFrac_Group,size=IsoFrac_Group)) +
+        geom_point(alpha=0.2) +
+        theme_minimal() +
+        labs(title = "2D Scatter Plot of Groups with Between-Group Distances")
+      hulls <- PCsubset[!is.na(PC1), .SD[chull(PC1, PC2)], by = IsoFrac_Group]
+      PCA_hull <- p+geom_polygon(data = hulls,
+                                 alpha = 0.2,color="transparent",aes(fill=IsoFrac_Group))
+    })
+    PCA_markers <- NULL
+    try({
+      
+      
+      MarkerHulls$IsoFrac_Group <- ""
+      MarkerHulls$DeltaMass_Category_Fac <- ""
+      PCA_markers <- ggplot(PCsubsetCentroid, aes(PC1, PC2,color=IsoFrac_Group, group = 1,pch=DeltaMass_Category_Fac))
+      it <- 0
+      rbcolors <- rainbow(length(unique(MarkerHulls$Marker)),v=0.8)
+      for(i in split(MarkerHulls,MarkerHulls$Marker)){
+        it <- it+1
+        PCA_markers <- PCA_markers+annotate("polygon", x = i$PC1, y = i$PC2, fill =rbcolors[it], colour = rbcolors[it],alpha=0.2)
+        PCA_markers <- PCA_markers+annotate("label",x= mean(i$PC1), y=mean(i$PC2),label=i$Marker[1])
+        
+      }
+      
+      yr <- range(PCsubsetCentroid$PC2)
+      xr <- range(PCsubsetCentroid$PC1)
+      
+      outzoom <- 0.5
+      
+      PCA_markers <- PCA_markers+
+        geom_path(color="grey",lwd=3) +                                        # respects row order
+        geom_point(aes(size=IsoFrac_Group_num),show.legend = F) +
+        geom_text(aes(label = IsoFrac_Group),show.legend = F, vjust = -0.5)+ggtitle(G)
+      PCA_markers_zoom <- PCA_markers+coord_cartesian(ylim=yr+diff(yr)*c(-outzoom,outzoom),xlim=xr+diff(xr)*c(-outzoom,outzoom))
+    })
+    
+    list(PCA_hull=PCA_hull,PCA_centroid=PCA_centroid,PCA_Peptide_Centroid=PCA_Peptide_Centroid,PCA_markers=PCA_markers,PCA_markers_zoom=PCA_markers_zoom)
+  }
+```
+
+
+## Candidates Subset
+
+```{r}
+
+duplicated(colnames(IsoFrac_Lopit_Results_dt_proteins))
+
+PP <- IsoFrac_Lopit_Results_dt_proteins[DeltaMass_Category_Fac=="Putative_Processing"]
+  PP <- PP[order(Wilcoxon_p_mn)]
+  ggp <- ggplot(PP,aes(Distance,-log10(Wilcoxon_p_mn ),label=hgnc_symbol))+geom_point()
+  ggp <- ggplot(PP,aes(Distance,-log10(Wilcoxon_p_mn ),label=hgnc_symbol))+geom_point()
+  ggd <-   ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,fill=Mode))+geom_density(alpha=0.9)+facet_grid("Condensed_DeltaMass_Category_Fac")
+
+  library(plotly)
+  ggplotly(ggp)
+  # Examples
+  g <- "BIRC6"
+  PCsubset <- IsoFrac_LOPIT_clean_split[g][[1]]
+  names(PCsubset) <- make.unique(names(PCsubset))
+  PCsubset$IsoFrac_MW
+  PCsubset$IsoFrac_MW.1
+  
+  PC_Hull_Plot(PCsubset)
+  PC_Hull_Plot <- function(PCsubset){
+    PCsubset$IsoFrac_Group <- as.character(PCsubset$IsoFrac_Group)
+    
+    p <- ggplot()
+    try({
+      p <- ggplot(PCsubset, aes(x = jitter(PC1), y = PC2, color = IsoFrac_Group,size=IsoFrac_Group)) +
+        geom_point(alpha=0.2) +
+        theme_minimal() +
+        labs(title = "2D Scatter Plot of Groups with Between-Group Distances")
+      hulls <- PCsubset[!is.na(PC1), .SD[chull(PC1, PC2)], by = IsoFrac_Group]
+      p <- p+geom_polygon(data = hulls,
+                          alpha = 0.2,color="transparent",aes(fill=IsoFrac_Group))
+    })
+    p+theme(legend.position = "none")
+  }
+```
+
+# Marker LOPIT Peptides
+
+
+```{r}
+q <- 0.05
+  IsoFrac_LOPIT_x <- lapply(split(IsoFrac_LOPIT,IsoFrac_LOPIT$markers),function(x){
+    x[!is.na(PC1)][ PC1 >= quantile(PC1, q) &
+                      PC1 <= quantile(PC1, 1 - q) &
+                      PC2 >= quantile(PC2, q) &
+                      
+                      PC2 <= quantile(PC2, 1 - q)]
+  })
+  IsoFrac_LOPITsubset <- rbindlist(IsoFrac_LOPIT_x)
+  names(IsoFrac_LOPIT) <- make.unique(names(IsoFrac_LOPIT))
+  MarkerHulls <- IsoFrac_LOPITsubset[!is.na(PC1)&markers!="unknown", .SD[chull(PC1, PC2)], by = Marker]
+  names(MarkerHulls) <- make.unique(names(MarkerHulls))
+  names(MarkerHulls) <- make.unique(names(MarkerHulls))
+  
+  PCA_markers <- ggplot(MarkerHulls, aes(x = (PC1), y = PC2, fill = Marker)) +geom_polygon(alpha=0.7)+geom_text(data=MarkerHulls[,.(PC1=mean(PC1),PC2=mean(PC2)),Marker],aes(label=Marker),color="grey40")
+  PCA_markers
+
+```
+
+
+## PCA Subcellular Space Map
+
+```{r}
+library(ggrepel)
+unique(MarkerHulls$Marker)
+
+PCA_markers2 <- ggplot(MarkerHulls, aes(x = PC1, y = PC2, fill = Marker,color=Marker))+geom_point(data=IsoFrac_LOPIT[!is.na(PC1)&Marker!="UNKNOWN"&!grepl("Ribosome",Marker)],alpha=0.2,show.legend = F,pch=20)
+PCA_markers2_hull <- PCA_markers2+geom_polygon(data=MarkerHulls,alpha=0.7,color="grey40")+
+  geom_label_repel(data=MarkerHulls[,.(PC1=mean(PC1),PC2=mean(PC2)),Marker],aes(label=as.character(Marker)),fill="white",show.legend = F)
+
+plot(PCA_markers2_hull)
+
+
+PCA_markers2 <- ggplot(MarkerHulls, aes(x = PC1, y = PC2, fill = Marker,color=Marker))+geom_point(data=IsoFrac_LOPIT[!is.na(PC1)&Marker!="UNKNOWN"&!grepl("Ribosome",Marker)],alpha=0.2,show.legend = F,pch=20)
+PCA_markers2_hull <- PCA_markers2+geom_polygon(data=MarkerHulls,alpha=0.7,color="grey40")+
+  geom_label_repel(data=MarkerHulls[,.(PC1=mean(PC1),PC2=mean(PC2)),Marker],aes(label=as.character(Marker)),fill="white",show.legend = F)
+
+PCA_markers2_publi <- PCA_markers2+geom_label_repel(data=MarkerHulls[,.(PC1=mean(PC1),PC2=mean(PC2)),Marker],aes(label=as.character(Marker)),fill="white",show.legend = F)
+
+PCA_markers2_hull_v2 <- PCA_markers2+geom_polygon(data=MarkerHulls,alpha=0.7,fill=NA)+
+  geom_label_repel(data=MarkerHulls[,.(PC1=mean(PC1),PC2=mean(PC2)),Marker],aes(label=as.character(Marker)),fill="white",show.legend = F)
+
+plot(PCA_markers2_hull)
+  
+```
+
+## Example Protein
+
+```{r}
+LOPITmap_ggOverlay <- function(PCsubset,MarkerHulls=NULL,AddCentroids=T,AddDistanceLines=T){
+      G <- PCsubset$hgnc_symbol[1]
+  try({
+    
+    PCA_Peptide_Centroid <- ggplot(PCsubset, aes(x = PC1, y = PC2, fill = as.character(IsoFrac_Group)))
+    PCsubsetCentroid <- PCsubset[,.(PC1=mean(PC1),PC2=mean(PC2),PC1sd=sd(PC1),PC2sd=sd(PC2)),.(IsoFrac_Group,IsoFrac_Group_num,DeltaMass_Category_Fac)]
+
+    
+        if(AddDistanceLines){
+      try({
+        PCsubsetPaths <- PCsubset[,{
+          gr <- .BY
+          within <- PCsubsetCentroid[IsoFrac_Group==gr$IsoFrac_Group]
+          toother <- PCsubsetCentroid[IsoFrac_Group!=gr$IsoFrac_Group]
+          
+          temp <- .SD
+          temp$BestCluster  <- NULL
+          temp$score_ref <- NULL
+          temp <- unique(temp)
+          temp <- temp[score_ref==max(score_ref)][1,]
+          list(PC1=c(temp$PC1,within$PC1,temp$PC1,toother$PC1),
+               PC2=c(temp$PC2,within$PC2,temp$PC2,toother$PC2),
+               group=c(rep("within",dim(within)[1]+1),rep("to other",dim(toother)[1]+1))
+               )
+        },.(Sequence,IsoFrac_Group)]
+        PCsubsetPaths_split <- split(PCsubsetPaths,paste(PCsubsetPaths$Sequence))
+        for(i in PCsubsetPaths_split){
+          
+          PCA_Peptide_Centroid <- PCA_Peptide_Centroid+ geom_path(data=i,aes(PC1,PC2,color=group),lwd=1)
+          
+        }
+        
+      })
+    }
+
+    
+    # Add Markers
+    if(length(MarkerHulls)>0){
+      rbcolors <- rainbow(length(unique(MarkerHulls$Marker)),v=0.8)
+      it <- 0
+      for(i in split(MarkerHulls,MarkerHulls$Marker)){
+        it <- it+1
+        
+        PCA_Peptide_Centroid <- PCA_Peptide_Centroid+annotate("polygon", x = i$PC1, y = i$PC2, fill =rbcolors[it], colour = rbcolors[it],alpha=0.1)
+        #PCA_Peptide_Centroid <- PCA_Peptide_Centroid+annotate("label",x= mean(i$PC1), y=mean(i$PC2),label=i$Marker[1],color=rbcolors[it])
+        
+      }
+      it <- 0
+      for(i in split(MarkerHulls,MarkerHulls$Marker)){
+        it <- it+1
+        
+        
+        #PCA_Peptide_Centroid <- PCA_Peptide_Centroid+annotate("polygon", x = i$PC1, y = i$PC2, fill =rbcolors[it], colour = rbcolors[it],alpha=0.1)
+        if(i$Marker[1]=="Lysosome"){
+           PCA_Peptide_Centroid <- PCA_Peptide_Centroid+annotate("label",x= mean(i$PC1), y=mean(i$PC2),label=i$Marker[1],color=rbcolors[it],hjust=1.3)
+        }else{
+           PCA_Peptide_Centroid <- PCA_Peptide_Centroid+annotate("label",x= mean(i$PC1), y=mean(i$PC2),label=i$Marker[1],color=rbcolors[it])
+        }
+       
+        
+      }
+    }
+
+    
+    # Adding Centroids
+    if(AddCentroids){
+      PCA_Peptide_Centroid <- 
+        PCA_Peptide_Centroid+geom_point(pch=21,cex=5)+
+        geom_point(data=PCsubsetCentroid,pch=23,cex=10)
+    }
+   
+    # add Centroid Path:
+    #PCA_Peptide_Centroid <- PCA_Peptide_Centroid+geom_path(data=PCsubsetCentroid,aes(PC1,PC2,group=1))
+    # Add Within and to other centroids:
+    
+    # Adding Distance Lines
+    
+    
+    PCA_Peptide_Centroid+theme(legend.title=element_blank())+ggtitle(G)+coord_cartesian(xlim=c(2,8),ylim=c(-2,5))
+  })
+  
+}
+
+IsoFrac_LOPIT$IsoFrac_MW <- IsoFrac_LOPIT$IsoFrac_MW.1
+grep("ENSG00000164733",IsoFrac_LOPIT$ENSG)
+
+PCsubset <- IsoFrac_LOPIT[hgnc_symbol=="CTSB"&!is.na(PC1)]
+
+names(PCsubset) <- make.unique(names(PCsubset))
+
+PCsubset[,IsoFrac_Group:=paste(sort(unique(IsoFrac_MW)),collapse=";"),Seq]
+PCsubset <- PCsubset[!is.na(IsoFrac_Group)]
+
+#PCsubset[,IsoFrac_Group:=IsoFrac_MW,Seq]
+
+#PCsubset$IsoFrac_Group <- as.character(PCsubset$IsoFrac_Group)
+PCsubset[,IsoFrac_Group_num:=median(unlist(strsplit(as.character(.BY$IsoFrac_Group),"_")),na.rm=T),IsoFrac_Group]
+PCsubset <- PCsubset[!is.na(PC1)]
+
+gg_CTSB_LOPIT <- LOPITmap_ggOverlay(PCsubset,MarkerHulls = MarkerHulls ,AddCentroids = T,AddDistanceLines = T)
+
+gg_CTSB_LOPIT$layers[[30]]$aes_params$size <- 4
+gg_CTSB_LOPIT$layers[[31]]$aes_params$size <- 4
+
+gg_CTSB_LOPIT
+
+```
+
+
+### Publication Figure
+```{r}
+
+
+
+
+PVALUES <- IsoFrac_Lopit_Results_dt_proteins[,{
+  temp <- .SD
+  splitDistance <- split(temp$Distance,temp$Mode)
+  wilcox.test(splitDistance[[1]],splitDistance[[2]])$p.value
+},.(Condensed_DeltaMass_Category_Fac)]
+PVALUES$Distance <- -0.5
+PVALUES$Mode <- ""
+IsoFrac_Lopit_Results_dt_proteins$DeltaMass_Category_Fac
+gbbp <- ggplot(IsoFrac_Lopit_Results_dt_proteins[!is.na(Mode)],aes(Distance,Condensed_DeltaMass_Category_Fac,fill=factor(Mode,c("","Randomize"),c("Real Distance pairs","Randomized"))))+geom_boxplot(orientation  ="y",outliers =F)+ylab("")+
+    xlab("Distance log2 FC 'to other'/'within'")+
+    geom_label(data=IsoFrac_Lopit_Results_dt_proteins_counts_melt_v2[variable=="Isoforms"],aes(label=paste("n:",value)),size=2.5,position = position_dodge(width = 0.5),hjust=1,show.legend = F)+ggplot2::scale_fill_manual(values = c("white","grey"))+theme(legend.title = element_blank(),legend.position="bottom")
+
+gbbp <- gbbp+geom_label(data=PVALUES,aes(label=paste("p:",signif(V1,1))),show.legend = F,angle = 90,size=2.5)
+gbbp
+
+save(IsoFrac_Lopit_Results_dt_proteins,PVALUES,gbbp,PCA_markers2_hull,gg_CTSB_LOPIT,file="LOPIT_Rebuttal_ForFigure.rda")
+```
+

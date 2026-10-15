@@ -1,0 +1,3524 @@
+---
+title: "ISOFRAC_SimilarityLoop"
+author: "Henrik Zauber"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+editor_options:
+  chunk_output_type: console
+---
+
+# Proteotranscriptomic Integration
+
+This analysis integrates IsoFrac-derived proteoform data with long-read PacBio transcript sequencing to improve protein isoform identification and interpretation. While IsoFrac detects proteoform-specific peptide traces across fractionation gradients, PacBio provides complementary full-length transcript evidence, enabling cross-validation between protein- and RNA-level isoforms.
+
+The workflow extends the IsoFrac similarity and enrichment framework by incorporating PacBio-derived protein sequences into the database comparison step. This allows each IsoFrac peak to be evaluated against both UniProt and PacBio candidates using a unified scoring model. By comparing enrichment, mass agreement, and machine learning–based scores, the pipeline identifies the most likely isoform assignments and highlights cases where PacBio uniquely explains observed proteoforms.
+
+In addition to improving assignment accuracy, this integration enables systematic comparisons between databases, quantification of agreement/discrepancies, and identification of potential novel isoforms supported by proteomics data. The results are summarized through enrichment analyses, ROC evaluation, delta-mass comparisons, and visualization of protein–RNA concordance.
+
+Overall, this RMarkdown documents a combined proteogenomic approach to refine isoform annotation by leveraging orthogonal evidence from mass spectrometry and long-read sequencing.
+
+
+## Initializaion
+
+
+This section prepares the PacBio protein reference dataset and integrates it with the IsoFrac workflow.
+
+It loads and cleans PacBio-derived ORF sequences, ensures consistent gene (ENSG) annotation, and aligns them with the existing UniProt-based protein database. Missing mappings are corrected where possible, and redundant entries are removed to obtain a unique sequence-level representation.
+
+Finally, the PacBio dataset is formatted to match the IsoFrac data structure and combined with previously generated IsoFrac results (Results_CombinedGels). Additional identifiers (e.g., PacBio-specific transcript codes) are created to enable downstream integration, comparison, and enrichment analysis between RNA-derived isoforms and proteomics evidence.
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+# Work from the Rmd location
+setwd(dirname(rstudioapi::documentPath()))
+
+# Container for all downstream results in this section
+Results_CombinedGels_PacBio <- list()
+
+
+  # ----------------------------------------------------------------------
+  # Load the cleaned PacBio object from disk
+  # ----------------------------------------------------------------------
+  # hu1 <- load("../IsoFrac_20230217_SimilaritiesTesting_2/ORFpacBioProteinID_20230328_mod2.rda")
+  # hu2 <- load("../IsoFrac_20230217_SimilaritiesTesting_2/ORFpacBioProteinID_20230328_mod3.rda")
+
+  # Collapse to unique sequences and drop columns not needed downstream
+  ORFpacBioProteinIDNew <- ORFpacBioProteinID[, {
+    temp <- .SD
+    temp$ProteinID <- NULL
+    temp$paralogues <- NULL
+    temp$overlaped <- NULL
+    temp$ORF_len <- NULL
+    temp <- unique(temp)
+
+    if (dim(temp)[1] > 1) {
+      dim(unique(temp))
+      stop()
+    }
+
+    temp
+    temp
+  }, SEQUENCE]
+
+  load("./ORFpacBioProteinID_20230328_mod4.rda")
+
+  # PacBio reference table used in the rest of the analysis
+  PacBIO <- ORFpacBioProteinIDNew
+
+
+# Ensure the PacBio results container exists
+if (!exists("Results_CombinedGels_PacBio")) {
+  Results_CombinedGels_PacBio <- list()
+}
+
+# Load the main IsoFrac combined-gels results
+load("Results_CombinedGels.rda")
+
+# ----------------------------------------------------------------------
+# Derive a PacBio-specific code from the "Other" field
+# ----------------------------------------------------------------------
+PacBIO[, PacBioCode := {
+  pb <- .BY$Other
+  paste(unique(grep("^PB\\.", unlist(strsplit(pb, ";|\\|")), value = TRUE)), collapse = ";")
+}, Other]
+
+# Create a combined ENST identifier that includes the PacBio code
+PacBIO$ENST2 <- paste(PacBIO$ENST, PacBIO$PacBioCode, sep = "_")
+PacBIO$ENST2[PacBIO$PacBioCode == ""] <- PacBIO$ENST[PacBIO$PacBioCode == ""]
+
+# Replace the original transcript identifier with the combined one
+PacBIO$ENST <- PacBIO$ENST2
+
+```
+
+## Extra Functions
+
+```{r}
+## --- Extra Functions ---------------------------------------------------------
+
+library(RSQLite)
+library(plotly)
+
+#------------------------------------------------------------------------------
+# Map peptide evidence and Pfam domains onto protein sequence positions
+#------------------------------------------------------------------------------
+IF_DB_Peptidemapping <- function(
+  x,
+  IsoFrac_Domain_SequenceAnalysis,
+  ProteinSequencesCategories,
+  symbol = 19,
+  invertOrder = FALSE,
+  geli = 1,
+  allgels = TRUE,
+  facetPlot = TRUE,
+  gelTraces = TRUE
+) {
+  cat("\r", x)
+
+  # Pull all peptide/domain annotations for the selected gene
+  subsetTable <<- IsoFrac_Domain_SequenceAnalysis[ENS == x]
+
+  # Optionally encode gel identity in the cluster label
+  if (allgels) {
+    subsetTable$HDBscanCluster <- paste(
+      subsetTable$HDBscanCluster,
+      gsub("_", ".", subsetTable$gels),
+      sep = "#"
+    )
+  } else {
+    subsetTable <- subsetTable[grep(c("5per", "8per", "10per")[geli], gels)]
+  }
+
+  # Get all protein sequences for this gene and prepare labels with MW
+  SEt <- ProteinSequencesCategories[ENSG == x, {
+    paste(paste(unique(ProteinID), collapse = ";"), round(mw(.BY$SEQUENCE)), sep = " MW:")
+  }, .(SEQUENCE)]
+
+  SE <- SEt$SEQUENCE
+  names(SE) <- gsub("_HUMAN", "", SEt$V1)
+
+  # Align sequences across isoforms
+  dfAlign <- msa::msa(SE, type = "protein", verbose = FALSE, method = "ClustalOmega")
+  dff <- as.data.frame(dfAlign@unmasked)
+
+  # Convert alignment coordinates to residue positions in each sequence
+  MatchFun <- lapply(strsplit(dff$x, ""), function(x) {
+    sapply(seq_along(x), function(y) {
+      if (x[y] != "-") sum(x[1:y] != "-") else 0
+    })
+  })
+
+  if (length(names(SE)) > 0) {
+    names(MatchFun) <- names(dfAlign@unmasked)
+  }
+
+  MatchFun <- lapply(MatchFun, function(x) {
+    x[x == 0] <- NA
+    x
+  })
+
+  # Long table: one row per alignment position / sequence
+  hu <- as.data.table(MatchFun)
+  hu$Position <- seq_len(nrow(hu))
+  hu <- melt(hu, id.vars = "Position")
+  hu[, MW := as.numeric(gsub(".*.MW:", "", variable)), value]
+  hu$variable <- factor(as.character(hu$variable), unique(hu$variable[order(hu$MW)]))
+
+  # Pfam/domain annotations for this gene
+  DomainInfo <- PfamDomainMappingsDomainSequence[ensembl_gene_id == x]
+  hu$Domain <- ""
+
+  print("Mapping Domains and Peptide to Protein Sequence")
+
+  # Iterate over each protein sequence in the alignment
+  for (i in unique(hu$variable)) {
+    SEi <- which(names(SE) == i)
+    SEsel <- SE[SEi]
+
+    # Add domain annotations for this sequence
+    if (length(SEsel) > 0) {
+      DomainInfoi <- DomainInfo[SEQUENCE == SEsel]
+      if (nrow(DomainInfoi) > 0) {
+        DomainInfoi[, {
+          sel <- !is.na(match(hu$value, .BY$pfam_start:.BY$pfam_end)) & hu$variable == i
+          hu$Domain[sel] <<- paste(hu$Domain[sel], .BY$Pfam_Description)
+          NULL
+        }, .(pfam_start, pfam_end, Pfam_Description)]
+      }
+    }
+
+    # Map peptide sequences onto the aligned sequence
+    selectedP <- subsetTable[ENS == x, ]
+    SEsel_IL <- gsub("I", "L", SEsel)
+
+    PeptidesMappings <- selectedP[, {
+      gr <- aregexec(.BY$sequence, SEsel_IL)
+      gr <- gr[gr > 0]
+      if (length(gr) > 0) {
+        sapply(gr, function(pos) pos:(pos + nchar(.BY$sequence) - 1))
+      } else {
+        as.integer(NA)
+      }
+    }, .(sequence, DomainCategory, ClusterType, Category, IsoFrac_MW, HDBscanCluster)]
+
+    # Encode peptide identity with the cluster label
+    PeptidesMappings$sequence <- paste(PeptidesMappings$sequence, PeptidesMappings$HDBscanCluster, sep = "_")
+
+    # Collapse multiple mappings into one entry per alignment position
+    PeptidesMappingsCollapsed <- PeptidesMappings[, .(
+      Category = paste(unique(Category[Category != "tryptic"]), collapse = ";"),
+      Mapped = length(Category),
+      IsoFrac = paste(sort(unique(IsoFrac_MW)), collapse = ";"),
+      Sequences = paste(unique(sequence), collapse = ";")
+    ), V1]
+
+    # Transfer peptide annotations back to alignment table
+    Posis <- hu$value
+    PeptidesMappingsCollapsedMatched <- PeptidesMappingsCollapsed[match(Posis, V1)]
+
+    hu$Category[hu$variable == i] <- PeptidesMappingsCollapsedMatched$Category[hu$variable == i]
+    hu$Identified_by_Peptide[hu$variable == i] <- PeptidesMappingsCollapsedMatched$V1[hu$variable == i]
+    hu$IsoFracMW[hu$variable == i] <- PeptidesMappingsCollapsedMatched$IsoFrac[hu$variable == i]
+    hu$Identified <- !is.na(hu$Identified_by_Peptide)
+    hu$Sequences[hu$variable == i] <- PeptidesMappingsCollapsedMatched$Sequences[hu$variable == i]
+  }
+
+  # Collapse domain labels per position
+  hu[, Domain_all := {
+    di <- unique(.SD$Domain)
+    paste(unique(di), collapse = ";")
+  }, Position]
+
+  # Mark peptide starts/ends for nterm/cterm calls
+  selectedP_terminal <- hu[Category == "new_nterm" | Category == "new_cterm",
+                           .(value = unique(value)),
+                           .(IsoFracMW, variable, Category, Position)]
+
+  hu$Domain_all <- gsub("^; ", "", hu$Domain_all)
+
+  # Plot proteins + Pfam domains
+  MSAPlot <- ggplot(
+    hu[!is.na(value)][order(MW)],
+    aes(Position, variable, color = Domain_all, size = Identified)
+  ) +
+    geom_point(pch = symbol, alpha = 0.5) +
+    ggplot2::scale_color_viridis_d() +
+    ylab("DataBase Entries")
+
+  # Prepare peptide-level plotting table
+  SpeciPeps <- hu[!is.na(value) & Identified == TRUE, .(
+    IsoFracMW_single = { unlist(strsplit(IsoFracMW, ";")) }
+  ), .(Position, variable, value, Domain, Category, Identified_by_Peptide, Identified, Domain_all, Sequences)]
+
+  SpeciPeps <- SpeciPeps[, {
+    sel <- rep(TRUE, nrow(.SD))
+    if (.BY$Category == "new_nterm") {
+      sel <- which(Position == min(Position))
+    }
+    if (.BY$Category == "new_cterm") {
+      sel <- which(Position == max(Position))
+    }
+    .SD[sel]
+  }, .(Category, Sequences)]
+
+  SpeciPeps$IsoFracMW_single <- factor(
+    SpeciPeps$IsoFracMW_single,
+    sort(as.numeric(unique(SpeciPeps$IsoFracMW_single)))
+  )
+
+  SpeciPeps <- SpeciPeps[, {
+    se <- unlist(strsplit(.BY$Sequences, ";"))
+    sefun <- lapply(se, function(z) {
+      xse <- unlist(strsplit(z, split = "_"))
+      data.table(Sequence = xse[1], cluster_single = xse[2])
+    })
+    rbindlist(sefun)
+  }, names(SpeciPeps)]
+
+  SpeciPeps$gels <- gsub("^.*.#", "", SpeciPeps$cluster_single)
+
+  # Plot peptides mapped to isoforms
+  MSAPlot2 <- ggplot(
+    SpeciPeps,
+    aes(Position, IsoFracMW_single, color = cluster_single, pch = cluster_single)
+  ) +
+    geom_point(position = position_dodge(width = 0.5)) +
+    ylab("IsoFrac IsoForms\nIdentified Peptides")
+
+  SpeciPeps$Category_offset <- as.numeric(
+    as.character(factor(SpeciPeps$Category, c("new_nterm", "new_cterm", ""), c(-0.5, 1, 0)))
+  )
+
+  ra <- range(hu$Position)
+
+  # Annotation for peptide start/end categories
+  ano_IF <- geom_vline(
+    xintercept = SpeciPeps$Position[grepl("new", SpeciPeps$Category)],
+    lty = "dotted",
+    color = "red",
+    size = 1
+  )
+
+  ano_UP <- annotate(
+    "text",
+    SpeciPeps$Position,
+    SpeciPeps$variable,
+    label = factor(SpeciPeps$Category, c("new_nterm", "new_cterm"), c(">", "<")),
+    color = "red",
+    cex = 5
+  )
+
+  MSAPlot <- MSAPlot + ano_UP + coord_cartesian(xlim = ra) + ggtitle("Proteins and Pfam Domains")
+
+  # Optional faceting by gel
+  if (gelTraces && allgels && facetPlot) {
+    MSAPlot2 <- MSAPlot2 + facet_wrap("gels", ncol = 1)
+  }
+
+  MSAPlot2 <<- MSAPlot2
+  MSAPlot <<- MSAPlot
+
+  # Combine the two panels in one output
+  if (invertOrder) {
+    ggout <- plot_grid(MSAPlot2, MSAPlot, ncol = 1, align = "hv", rel_heights = c(2, 1.5))
+  } else {
+    ggout <- plot_grid(
+      MSAPlot + ano_UP + coord_cartesian(xlim = ra) + ggtitle("Proteins and Pfam Domains"),
+      MSAPlot2 + ano_IF + coord_cartesian(xlim = ra) + ggtitle("Mapped Peptides per IsoFrac Isoform"),
+      ncol = 1,
+      align = "hv"
+    )
+  }
+
+  list(
+    gg = ggout,
+    table = hu,
+    SpecIDs = SpeciPeps,
+    MSAPlot = MSAPlot + ano_UP + coord_cartesian(xlim = ra),
+    MSAPlot2 = MSAPlot2 + ano_IF + coord_cartesian(xlim = ra)
+  )
+}
+
+#------------------------------------------------------------------------------
+# Variant with a Pfam-domain fallback for sequences beginning with M
+#------------------------------------------------------------------------------
+IF_DB_Peptidemapping_modified <- function(
+  x,
+  IsoFrac_Domain_SequenceAnalysis,
+  ProteinSequencesCategories,
+  symbol = 19,
+  invertOrder = FALSE,
+  geli = 1,
+  allgels = TRUE,
+  facetPlot = TRUE,
+  gelTraces = TRUE
+) {
+  cat("\r", x)
+
+  subsetTable <<- IsoFrac_Domain_SequenceAnalysis[ENS == x]
+
+  if (allgels) {
+    subsetTable$HDBscanCluster <- paste(
+      subsetTable$HDBscanCluster,
+      gsub("_", ".", subsetTable$gels),
+      sep = "#"
+    )
+  } else {
+    subsetTable <- subsetTable[grep(c("5per", "8per", "10per")[geli], gels)]
+  }
+
+  # Sequences to align
+  SEt <- ProteinSequencesCategories[ENSG == x, {
+    paste(paste(unique(ProteinID), collapse = ";"), round(mw(.BY$SEQUENCE)), sep = " MW:")
+  }, .(SEQUENCE)]
+
+  SE <- SEt$SEQUENCE
+  names(SE) <- gsub("_HUMAN", "", SEt$V1)
+
+  dfAlign <- msa::msa(SE, type = "protein", verbose = FALSE, method = "ClustalOmega")
+  dff <- as.data.frame(dfAlign@unmasked)
+
+  MatchFun <- lapply(strsplit(dff$x, ""), function(x) {
+    sapply(seq_along(x), function(y) {
+      if (x[y] != "-") sum(x[1:y] != "-") else 0
+    })
+  })
+
+  if (length(names(SE)) > 0) {
+    names(MatchFun) <- names(dfAlign@unmasked)
+  }
+
+  MatchFun <- lapply(MatchFun, function(x) {
+    x[x == 0] <- NA
+    x
+  })
+
+  hu <- as.data.table(MatchFun)
+  hu$Position <- seq_len(nrow(hu))
+  hu <- melt(hu, id.vars = "Position")
+  hu[, MW := as.numeric(gsub(".*.MW:", "", variable)), value]
+  hu$variable <- factor(as.character(hu$variable), unique(hu$variable[order(hu$MW)]))
+
+  DomainInfo <- PfamDomainMappingsDomainSequence[ensembl_gene_id == x]
+  hu$Domain <- ""
+
+  print("Mapping Domains and Peptide to Protein Sequence")
+
+  for (i in unique(hu$variable)) {
+    SEi <- which(names(SE) == i)
+    SEsel <- SE[SEi]
+
+    if (length(SEsel) > 0) {
+      DomainInfoi <- DomainInfo[SEQUENCE == SEsel]
+      if (nrow(DomainInfoi) == 0) {
+        # Fallback: try sequence without leading M
+        DomainInfoi <- DomainInfo[SEQUENCE == gsub("^M", "", SEsel)]
+      }
+
+      if (nrow(DomainInfoi) > 0) {
+        Dfun <<- DomainInfoi[, {
+          sel <- !is.na(match(hu$value, .BY$pfam_start:.BY$pfam_end)) & hu$variable == i
+          hu$Domain[sel] <<- paste(hu$Domain[sel], .BY$Pfam_Description)
+          NULL
+        }, .(pfam_start, pfam_end, Pfam_Description)]
+
+        if (nrow(Dfun) > 0) {
+          stop()
+        }
+      }
+    }
+
+    # Map peptides onto the aligned protein sequence
+    selectedP <- subsetTable[ENS == x, ]
+    SEsel_IL <- gsub("I", "L", SEsel)
+
+    PeptidesMappings <- selectedP[, {
+      gr <- aregexec(.BY$sequence, SEsel_IL)
+      gr <- gr[gr > 0]
+      if (length(gr) > 0) {
+        sapply(gr, function(pos) pos:(pos + nchar(.BY$sequence) - 1))
+      } else {
+        as.integer(NA)
+      }
+    }, .(sequence, DomainCategory, ClusterType, Category, IsoFrac_MW, HDBscanCluster)]
+
+    PeptidesMappings$sequence <- paste(PeptidesMappings$sequence, PeptidesMappings$HDBscanCluster, sep = "_")
+
+    PeptidesMappingsCollapsed <- PeptidesMappings[, .(
+      Category = paste(unique(Category[Category != "tryptic"]), collapse = ";"),
+      Mapped = length(Category),
+      IsoFrac = paste(sort(unique(IsoFrac_MW)), collapse = ";"),
+      Sequences = paste(unique(sequence), collapse = ";")
+    ), V1]
+
+    Posis <- hu$value
+    PeptidesMappingsCollapsedMatched <- PeptidesMappingsCollapsed[match(Posis, V1)]
+
+    hu$Category[hu$variable == i] <- PeptidesMappingsCollapsedMatched$Category[hu$variable == i]
+    hu$Identified_by_Peptide[hu$variable == i] <- PeptidesMappingsCollapsedMatched$V1[hu$variable == i]
+    hu$IsoFracMW[hu$variable == i] <- PeptidesMappingsCollapsedMatched$IsoFrac[hu$variable == i]
+    hu$Identified <- !is.na(hu$Identified_by_Peptide)
+    hu$Sequences[hu$variable == i] <- PeptidesMappingsCollapsedMatched$Sequences[hu$variable == i]
+  }
+
+  hu[, Domain_all := {
+    di <- unique(.SD$Domain)
+    paste(unique(di), collapse = ";")
+  }, Position]
+
+  selectedP_terminal <- hu[Category == "new_nterm" | Category == "new_cterm",
+                           .(value = unique(value)),
+                           .(IsoFracMW, variable, Category, Position)]
+
+  hu$Domain_all <- gsub("^; ", "", hu$Domain_all)
+
+  MSAPlot <- ggplot(
+    hu[!is.na(value)][order(MW)],
+    aes(Position, variable, color = Domain_all, size = Identified)
+  ) +
+    geom_point(pch = symbol, alpha = 0.5) +
+    ggplot2::scale_color_viridis_d() +
+    ylab("DataBase Entries")
+
+  SpeciPeps <- hu[!is.na(value) & Identified == TRUE, .(
+    IsoFracMW_single = { unlist(strsplit(IsoFracMW, ";")) }
+  ), .(Position, variable, value, Domain, Category, Identified_by_Peptide, Identified, Domain_all, Sequences)]
+
+  SpeciPeps <- SpeciPeps[, {
+    sel <- rep(TRUE, nrow(.SD))
+    if (.BY$Category == "new_nterm") sel <- which(Position == min(Position))
+    if (.BY$Category == "new_cterm") sel <- which(Position == max(Position))
+    .SD[sel]
+  }, .(Category, Sequences)]
+
+  SpeciPeps$IsoFracMW_single <- factor(
+    SpeciPeps$IsoFracMW_single,
+    sort(as.numeric(unique(SpeciPeps$IsoFracMW_single)))
+  )
+
+  SpeciPeps <- SpeciPeps[, {
+    se <- unlist(strsplit(.BY$Sequences, ";"))
+    sefun <- lapply(se, function(z) {
+      xse <- unlist(strsplit(z, split = "_"))
+      data.table(Sequence = xse[1], cluster_single = xse[2])
+    })
+    rbindlist(sefun)
+  }, names(SpeciPeps)]
+
+  SpeciPeps$gels <- gsub("^.*.#", "", SpeciPeps$cluster_single)
+
+  # Drop a small set of unwanted peptide/isoform combinations
+  SpeciPeps <- SpeciPeps[!(
+    IsoFracMW_single == "20157" &
+      Sequence != "EDGPEGLDK" &
+      Sequence != "AMNLDQVSK" &
+      Sequence != "QVSSHLQVLAR"
+  )]
+
+  MSAPlot2 <- ggplot(
+    SpeciPeps,
+    aes(Position, IsoFracMW_single, color = cluster_single, pch = cluster_single)
+  ) +
+    geom_point(position = position_dodge(width = 0.5)) +
+    ylab("IsoFrac IsoForms\nIdentified Peptides")
+
+  SpeciPeps2 <- SpeciPeps[, .(confidence = .N), .(Position, IsoFracMW_single)]
+  SpeciPeps2$MWkd <- as.character(round(as.numeric(as.character(SpeciPeps2$IsoFracMW_single)) / 1000, 1))
+
+  # Domain rectangles for compact domain visualization
+  huha <<- hu[, as.list(range(Position)), .(variable, Domain)]
+  huha <- huha[Domain != ""]
+
+  rects <- data.table(
+    xmin = huha$V1,
+    xmax = huha$V2,
+    ymin = -Inf,
+    ymax = Inf,
+    fill = huha$Domain
+  )
+
+  MSAPlot3 <- ggplot() +
+    geom_rect(
+      data = rects[fill != ""],
+      aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+      alpha = 0.5
+    ) +
+    geom_point(
+      data = SpeciPeps2,
+      aes(Position, MWkd, color = "identified peptides"),
+      pch = "|",
+      position = position_dodge(width = 0.5),
+      size = 10
+    ) +
+    ylab("IsoFrac MW [kD]") +
+    xlab("Meta Gene Position") +
+    scale_color_manual(name = "identified peptides", values = c("black")) +
+    theme(legend.title = element_blank())
+
+  SpeciPeps$Category_offset <- as.numeric(
+    as.character(factor(SpeciPeps$Category, c("new_nterm", "new_cterm", ""), c(-0.5, 1, 0)))
+  )
+
+  ra <- range(hu$Position)
+
+  ano_IF <- geom_vline(
+    xintercept = SpeciPeps$Position[grepl("new", SpeciPeps$Category)],
+    lty = "dotted",
+    color = "red",
+    size = 1
+  )
+
+  ano_UP <- annotate(
+    "text",
+    SpeciPeps$Position,
+    SpeciPeps$variable,
+    label = factor(SpeciPeps$Category, c("new_nterm", "new_cterm"), c(">", "<")),
+    color = "red",
+    cex = 5
+  )
+
+  MSAPlot <- MSAPlot + ano_UP + coord_cartesian(xlim = ra) + ggtitle("Proteins and Pfam Domains")
+
+  if (gelTraces && allgels && facetPlot) {
+    MSAPlot2 <- MSAPlot2 + facet_wrap("gels", ncol = 1)
+  }
+
+  MSAPlot2 <<- MSAPlot2
+  MSAPlot <<- MSAPlot
+
+  if (invertOrder) {
+    ggout <- plot_grid(MSAPlot2, MSAPlot, ncol = 1, align = "hv", rel_heights = c(2, 1.5))
+  } else {
+    ggout <- plot_grid(
+      MSAPlot + ano_UP + coord_cartesian(xlim = ra) + ggtitle("Proteins and Pfam Domains"),
+      MSAPlot2 + ano_IF + coord_cartesian(xlim = ra) + ggtitle("Mapped Peptides per IsoFrac Isoform"),
+      ncol = 1,
+      align = "hv"
+    )
+  }
+
+  list(
+    gg = ggout,
+    table = hu,
+    SpecIDs = SpeciPeps,
+    MSAPlot = MSAPlot + ano_UP + coord_cartesian(xlim = ra),
+    MSAPlot2 = MSAPlot2 + ano_IF + coord_cartesian(xlim = ra),
+    MSAPlot3 = MSAPlot3 + ano_IF + coord_cartesian(xlim = ra)
+  )
+}
+
+#------------------------------------------------------------------------------
+# Read trace intensity profiles directly from the SQLite DB and plot them
+#------------------------------------------------------------------------------
+Traces_from_DB <- function(x, dbpath = "../FinalViewer/IsoFrac_0.84/TableListNormEnsHdbScanMW_Peaks.sqlite", gel = 2) {
+  db <- dbConnect(SQLite(), dbpath)
+  dbl <- dbListTables(db)
+
+  ensg_vec <- x
+  gelSelection <- c("Exp1_5per_Try", "Exp1_8per_Try", "Exp1_10per_Try")[gel]
+
+  zn <- grep("zscore", dbl, value = TRUE)
+  zn <- grep(gelSelection, zn, value = TRUE)
+
+  hr <- grep("hdbscanTables_", dbListTables(db), value = TRUE)
+  hr <- grep(gelSelection, hr, value = TRUE)
+
+  mw <- grep("Fractions_MW", dbl, value = TRUE)
+  mw <- grep(gelSelection, mw, value = TRUE)
+
+  if (length(hr) > 1) {
+    print("Too many selected candidates, picking first entry.")
+    hr <- hr[1]
+    zn <- zn[1]
+  }
+
+  hdbscans <- data.table(dbGetQuery(
+    db,
+    paste("SELECT * FROM", paste("'", hr, "'", sep = ""), "WHERE EnsG = ", paste("'", ensg_vec, "'", sep = ""))
+  ))
+
+  IdentifiedPeaks_Table <- data.table(dbGetQuery(
+    db,
+    paste("SELECT * FROM IdentifiedPeaks_Table WHERE Ens=", paste("'", ensg_vec, "'", sep = ""))
+  ))
+
+  # Read z-score traces for each cluster row
+  zscore <- lapply(hdbscans$id, function(x) {
+    dbGetQuery(
+      db,
+      paste("SELECT * FROM", paste("'", zn, "'", sep = ""), "LIMIT 1 OFFSET", x - 1)
+    )
+  })
+
+  zscoredt <- rbindlist(zscore)
+  zscoredt$id <- hdbscans$id
+  zscoredt$cl <- hdbscans$cl_2
+  zscoredt$Seq <- hdbscans$Seq
+
+  zscoredt_melt <- melt(zscoredt, id.vars = c("id", "cl", "Seq"))
+
+  # Add molecular weight axis for fraction positions
+  mwDT <- dbReadTable(db, mw)
+  zscoredt_melt$MW <- mwDT[as.numeric(gsub("V", "", zscoredt_melt$variable)), 1]
+
+  CPP <<- data.table(dbGetQuery(
+    db,
+    paste("SELECT * FROM Compressed_Pairs WHERE ENS=", paste("'", ensg_vec, "'", sep = ""))
+  ))
+
+  dbDisconnect(db)
+
+  plotlyScale <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                   "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf")
+
+  zscoredt_melt$color <- rev(plotlyScale)[as.numeric(zscoredt_melt$cl) + 1]
+
+  ggplot(zscoredt_melt, aes(10^MW, value, group = id, color = cl)) +
+    geom_line(lwd = 1) +
+    annotate(
+      "segment",
+      x = 10^CPP$MW_lm_gel_lo,
+      xend = 10^CPP$MW_lm_gel_hi,
+      y = CPP$Height,
+      yend = CPP$Height,
+      cex = 1,
+      color = "grey"
+    ) +
+    annotate("text", 10^CPP$MW_lm, CPP$Height, label = "*", cex = 15, color = "red")
+}
+
+#------------------------------------------------------------------------------
+# Extract one gene's data bundle from the SQLite DB for downstream plotting
+#------------------------------------------------------------------------------
+Extract_IsoFrac_Info <- function(ROC, input) {
+  print("Connecting")
+  db <- dbConnect(SQLite(), dbPath)
+
+  print("Checking")
+  gnhu <<- input$GN
+  if (gnhu == "") {
+    return(NULL)
+  }
+
+  dt_gn_all <<- data.table(dbReadTable(db, "GN"))
+  dt_gn_sel <- dt_gn_all[gel == input$inputtable]
+
+  gnpos <- which(dt_gn_sel$ens == input$GN)
+
+  dataset_init <- list()
+
+  # Input table for this gene / gel
+  tabname <<- paste("TMTSubset_final_singlenorm_zscore", input$inputtable, sep = "_#_")
+  temp <- dbReadTable(db, tabname)
+  TMTValues <- data.table(temp[gnpos, ])
+  dataset_init$inputtable <- TMTValues
+
+  # MW information
+  tabname <- paste("Protein_MW", input$inputtable, sep = "_#_")
+  dataset_init$Protein_MW <- dbReadTable(db, tabname)
+
+  tabname <- paste("Fractions_MW", input$inputtable, sep = "_#_")
+  dataset_init$Fractions_MW <- dbReadTable(db, tabname)
+
+  tabname <- paste("hdbscanTables", input$inputtable, sep = "_#_")
+  dataset_init$hdbscanTables <- data.table(dbGetQuery(
+    db,
+    paste("SELECT * FROM", paste("'", tabname, "'", sep = ""), "WHERE EnsG = ", paste("'", input$GN, "'", sep = ""))
+  ))
+
+  # Make cluster labels compatible
+  d <- dataset_init$hdbscanTables
+  nonzeros <- d$BestCluster[d$BestCluster != "0"]
+  nonzeros <- c(0, unique(d$BestCluster))
+  nonzeros[is.na(nonzeros)] <- 0
+  d$BestCluster <- factor(d$BestCluster, unique(nonzeros))
+  dataset_init$hdbscanTables <- d
+
+  dataset_init$ID <- gnpos
+  dataset_init$dt_gn <- dt_gn_sel[gnpos]
+
+  # Pair tables
+  dataset_init$IdentifiedPeaks_Table <- data.table(dbGetQuery(
+    db,
+    paste(
+      "SELECT * FROM IdentifiedPeaks_Table WHERE Ens=",
+      paste("'", input$GN, "'", sep = ""),
+      "AND gel=",
+      paste("'", input$inputtable, "'", sep = "")
+    )
+  ), integer64 = "double")
+
+  dataset_init$CombinedGels_Pairs_Filtered <- data.table(dbGetQuery(
+    db,
+    paste("SELECT * FROM CombinedGels_Pairs_Filtered WHERE ENS =", paste("'", input$GN, "'", sep = ""))
+  ), integer64 = "double")
+
+  dataset_init$CombinedGels_Pairs_Filtered_PB <- data.table(dbGetQuery(
+    db,
+    paste("SELECT * FROM CombinedGels_Pairs_Filtered_PACBIO WHERE ENS =", paste("'", input$GN, "'", sep = ""))
+  ), integer64 = "double")
+
+  dataset_init$Pairs_Filtered_Compressed <- data.table(dbGetQuery(
+    db,
+    paste("SELECT * FROM CombinedGels_Compressed_Pairs WHERE ENS =", paste("'", input$GN, "'", sep = ""))
+  ), integer64 = "double")
+
+  # Peak results table
+  dataset_init$IsoFrac_PeakResultsTable <- DF_numericClass(data.table(dbGetQuery(
+    db,
+    paste(
+      "SELECT * FROM IsoFrac_PeakResultsTable WHERE ENS =",
+      paste("'", input$GN, "'", sep = ""),
+      "AND gel =",
+      paste("'", input$inputtable, "'", sep = "")
+    )
+  )))
+
+  # Keep only peaks that match the compressed-pair definitions
+  tempPeaks <- dataset_init$Pairs_Filtered_Compressed[, {
+    gr <- lapply(.BY, as.character)
+    hu <- lapply(gr, strsplit, split = ";")
+    names(hu) <- paste(names(hu), "split", sep = "_")
+    hu$Compressed_MW_Variants <- .GRP
+    lapply(hu, unlist)
+  }, .(gels, clusters, heights, Peaks_collapse, MW_lm)]
+
+  tempPeaks <- tempPeaks[gels_split == input$inputtable]
+  tempPeaks$cluster2 <- tempPeaks$clusters_split
+  tempPeaks$MW_lm_Compressed_ <- tempPeaks$MW_lm
+
+  dataset_init$IdentifiedPeaks_Table <- dataset_init$IdentifiedPeaks_Table[
+    !is.na(match(Peak, tempPeaks$Peaks_collapse_split)) &
+      !is.na(match(cluster2, tempPeaks$clusters_split))
+  ]
+
+  dbDisconnect(db)
+  dataset_init
+}
+
+#------------------------------------------------------------------------------
+# Coerce columns that are mostly numeric into numeric
+#------------------------------------------------------------------------------
+DF_numericClass <- function(x) {
+  hum <- sapply(x, function(col) {
+    n_na_before <- sum(is.na(col))
+    n_na_after <- sum(is.na(as.numeric(col)))
+    n_na_after > n_na_before
+  })
+
+  df <- as.data.frame(x)
+  for (i in which(!hum)) {
+    class(df[, i]) <- "numeric"
+  }
+  df
+}
+
+#------------------------------------------------------------------------------
+# Plot fraction-wise peptide intensity traces, with optional cluster averaging
+#------------------------------------------------------------------------------
+Traces_Plotly <- function(
+  input_data,
+  mpwcutoff = 0,
+  converttoMW = TRUE,
+  IntensityCutoff = 0.1,
+  cbPalette = c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"),
+  PurePlot = FALSE,
+  showlegend = TRUE,
+  MeanCluster = FALSE,
+  ShowQuantiles = TRUE,
+  addPolygon = TRUE,
+  linelwd = 2,
+  vjust_value = -2,
+  StarSize = 5
+) {
+  input_data <<- input_data
+
+  ens <- paste(unique(input_data$dt_gn$ens, input_data$dt_gn$hgnc_symbol), collapse = "")
+  hdb <- input_data$hdbscanTables
+  tempValues <- input_data$inputtable
+  hdb <- hdb[match(input_data$ID, hdb$id), ]
+
+  # Attach cluster labels to fraction matrix
+  tempValues$cl <- as.numeric(as.character(hdb$cl_2))
+  vec <- 0:max(tempValues$cl, na.rm = TRUE)
+  tempValues$cl <- factor(tempValues$cl, vec, c("noise traces", vec[-1]))
+  tempValues$id <- hdb$id
+
+  # Melt fraction table into long format
+  if (any(grepl("^V[0-9]", colnames(tempValues)[1]))) {
+    me <- melt(tempValues, measure.vars = paste("V", 1:28, sep = ""), id.vars = c("cl", "id"))
+    me$variable <- as.numeric(gsub("V", "", me$variable))
+  } else {
+    colnames(tempValues) <- gsub("X", "", colnames(tempValues))
+    me <- melt(tempValues, measure.vars = as.character(2:29), id.vars = c("cl", "id"))
+    me$variable <- as.numeric(as.character(me$variable))
+    me$variable <- me$variable - min(me$variable)
+  }
+
+  me <- me[!is.na(variable)]
+
+  # Convert fraction indices to MW if requested
+  if (length(input_data$Fractions_MW$x.Fractions_predicted_MW) > 0 && converttoMW) {
+    mds <- input_data$Fractions_MW$x.Fractions_predicted_MW[1:28]
+    me$variable <- 10^mds[match(me$variable, 1:28)]
+  }
+
+  # Add a terminal NA row to visually break traces
+  me <- rbind(me, me[, .(value = max(value) + 1, variable = NA), .(id, cl)])
+
+  me$cl <- factor(me$cl)
+  me$seq <- input_data$dt_gn$seq[match(me$id, input_data$ID)]
+
+  me <- me[order(id, variable)]
+  me[, idtemp := .GRP, .(cl, id)]
+  try(me <- me[order(as.numeric(idtemp))], silent = TRUE)
+  try(me <- me[order(as.character(seq))], silent = TRUE)
+  try(me <- me[order(as.numeric(cl))], silent = TRUE)
+  try(me <- me[order(as.numeric(id))], silent = TRUE)
+
+  # Hide duplicate legend entries
+  idCount <- 0
+  idRemove <- c()
+  for (i in unique(me$cl)) {
+    ids <- unique(me[cl == i]$id)
+    ids <- seq_along(ids) + idCount
+    idCount <- max(ids)
+    idRemove <- c(idRemove, ids[-1])
+  }
+
+  # Optionally average all traces within each cluster
+  if (MeanCluster) {
+    me <- me[, .(
+      value = mean(value, na.rm = TRUE),
+      q90 = quantile(value, 0.9, na.rm = TRUE),
+      q10 = quantile(value, 0.1, na.rm = TRUE),
+      n = length(value),
+      seq = paste(unique(seq), collapse = "\n"),
+      idtemp = .GRP,
+      id = .GRP
+    ), .(cl, variable)]
+  }
+
+  cbp <- colorRampPalette(cbPalette)(max(as.numeric(me$cl), na.rm = TRUE))
+  cbp <- c("#73FDFF", cbp)
+
+  if (PurePlot) {
+    cbp <- "#00000080"
+    me$color <- "black"
+    me$name <- ""
+    me$legendgroup <- ""
+  } else {
+    me$color <- cbp[as.numeric(as.character(me$cl)) + 1]
+  }
+
+  me$q90a <- me$q90
+  me$q10a <- me$q10
+
+  if (ShowQuantiles && MeanCluster) {
+    me$q90 <- abs(me$q90 - me$value)
+    me$q10 <- abs(me$value - me$q10)
+  } else {
+    me$q90 <- NA
+    me$q10 <- NA
+  }
+
+  me <- me[!is.na(cl) & !is.na(value)]
+
+  # Static ggplot representation
+  g2 <- ggplot(me, aes(as.numeric(variable) / 1000, value, group = id, color = as.character(cl))) +
+    geom_line(lwd = linelwd)
+
+  # Overlay peak positions
+  Peaks <- input_data$Pairs_Filtered_Compressed
+  PeaksCheck <<- Peaks
+  Peaks <- Peaks[Intensity > IntensityCutoff]
+
+  Peaks[, c("Peak", "Start", "End") := .(
+    Peak = 10^as.numeric(MW_lm_Compressed_) / 1000,
+    Start = 10^as.numeric(Start_MW) / 1000,
+    End = 10^as.numeric(End_MW) / 1000
+  ), MW_lm_Compressed_]
+
+  xcutoff <- 5
+  Peaks[, c("Start", "End") := {
+    if (abs(Start - Peak) > xcutoff) Start <- Peak - xcutoff
+    if (abs(Peak - End) > xcutoff) End <- Peak + xcutoff
+    list(Start, End)
+  }, MW_lm_Compressed_]
+
+  g2 <- g2 +
+    annotate(
+      "pointrange",
+      x = Peaks$Peak,
+      y = as.numeric(Peaks$Height),
+      xmin = Peaks$Start,
+      xmax = Peaks$End,
+      colour = "grey",
+      size = 2.5,
+      shape = NA,
+      linewidth = 1.5
+    ) +
+    annotate(
+      "point",
+      x = 10^as.numeric(Peaks$MW_lm_Compressed_) / 1000,
+      y = as.numeric(Peaks$Height),
+      color = "red",
+      bg = "red",
+      shape = 24,
+      size = StarSize,
+      lwd = 20
+    ) +
+    annotate(
+      "point",
+      x = 10^as.numeric(Peaks$MW_lm_Compressed_) / 1000,
+      y = as.numeric(Peaks$Height),
+      color = "red",
+      bg = "red",
+      shape = 25,
+      size = StarSize,
+      lwd = 20
+    ) +
+    annotate(
+      "text",
+      x = 10^as.numeric(Peaks$MW_lm_Compressed_) / 1000,
+      y = as.numeric(Peaks$Height),
+      label = round(10^as.numeric(Peaks$MW_lm_Compressed_) / 1000, 1),
+      vjust = vjust_value,
+      hjust = 0.5,
+      color = "red",
+      bg = "red",
+      shape = 25,
+      size = 5,
+      lwd = 20
+    ) +
+    ylab("peptide intensity trace [zscore]") +
+    xlab("MW [kD]") +
+    ggplot2::scale_color_viridis_d()
+
+  # Interactive plotly version
+  p <- plot_ly(
+    me,
+    x = ~variable,
+    y = ~value,
+    color = ~cl,
+    name = ~cl,
+    legendgroup = ~cl,
+    type = "scatter",
+    mode = "lines",
+    hoverinfo = "text",
+    text = me$seq,
+    colors = cbp,
+    line = list(width = 3)
+  ) %>%
+    layout(showlegend = TRUE)
+
+  p <- try(p %>% style(showlegend = FALSE, traces = idRemove), silent = TRUE)
+
+  # Optional cluster envelope polygons
+  if (addPolygon && MeanCluster) {
+    for (i in unique(me$cl)) {
+      mei <- me[cl == i]
+      mei <- mei[order(variable, decreasing = TRUE)]
+      mei <- mei[!is.na(variable)]
+      mei$color[is.na(mei$color)] <- "#73FDFF"
+
+      p <- p %>% add_polygons(
+        x = c(mei$variable, rev(mei$variable), mei$variable[1]),
+        y = c(mei$q90a, rev(mei$q10a), mei$q90a[1]),
+        line = list(width = 2, color = "transparent"),
+        fillcolor = paste(mei$color[1], 20, sep = ""),
+        inherit = FALSE,
+        legendgroup = mei$cl[1],
+        name = "0.1 to 0.9 Q"
+      )
+    }
+  }
+
+  p <- p %>%
+    layout(
+      title = ens,
+      xaxis = list(title = "MW converted fraction"),
+      yaxis = list(title = "zscore"),
+      legend = list(title = list(text = "Peptide Clusters")),
+      showlegend = showlegend
+    )
+
+  list(p = p, g = g2, data = me, clusterColors = cbp)
+}
+
+#------------------------------------------------------------------------------
+# Alternative plotly wrapper with explicit coloring/filtering controls
+#------------------------------------------------------------------------------
+Traces_Plotly2 <- function(
+  input,
+  ens = "ENSG00000120802",
+  mpwcutoff = 0,
+  converttoMW = TRUE,
+  cbPalette = c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"),
+  PurePlot = FALSE,
+  showlegend = TRUE,
+  MeanCluster = FALSE,
+  ShowQuantiles = TRUE,
+  colorClusters = NULL,
+  colorSequences = NULL
+) {
+  ens <<- ens
+
+  hdb <- input$hdbscanTables[EnsG == ens]
+  tempValues <- input$TMTSubset_final_singlenorm_zscore[hdb$id, ]
+
+  tempValues$cl <- hdb$cl_2
+  tempValues$id <- hdb$id
+  tempValues$sequences <- hdb$Seq
+
+  if (any(grepl("^V[0-9]", colnames(tempValues)[1]))) {
+    me <- melt(tempValues, measure.vars = paste("V", 1:28, sep = ""), id.vars = c("cl", "id"))
+    me$variable <- as.numeric(gsub("V", "", me$variable))
+  } else {
+    me <- melt(tempValues, measure.vars = as.character(2:29), id.vars = c("cl", "id"))
+    me$variable <- as.numeric(as.character(me$variable))
+    me$variable <- me$variable - min(me$variable) + 1
+  }
+
+  if (length(input$Fractions_predicted_MW) > 0 && converttoMW) {
+    mds <- input$Fractions_predicted_MW[1:28]
+    me$variable <- 10^mds[match(me$variable, 1:28)]
+  }
+
+  # Add a terminal NA row to break traces
+  me <- rbind(
+    me,
+    me[, .(value = max(value, na.rm = TRUE) + 1, variable = NA), .(id, cl)],
+    fill = TRUE
+  )
+
+  me$cl <- factor(me$cl)
+  me$seq <- input$dt_gn$seq[me$id]
+  me$match <- 0
+
+  me <- me[order(id, variable)]
+  me[, idtemp := .GRP, .(cl, id)]
+  try(me <- me[order(idtemp)], silent = TRUE)
+  try(me <- me[order(seq)], silent = TRUE)
+  try(me <- me[order(cl)], silent = TRUE)
+  try(me <- me[order(id)], silent = TRUE)
+
+  # Hide duplicate legend entries
+  idCount <- 0
+  idRemove <- c()
+  for (i in unique(me$cl)) {
+    ids <- unique(me[cl == i]$id)
+    ids <- seq_along(ids) + idCount
+    idCount <- max(ids)
+    idRemove <- c(idRemove, ids[-1])
+  }
+
+  if (MeanCluster) {
+    print(dim(me))
+    me <- me[, .(
+      value = mean(value, na.rm = TRUE),
+      q90 = quantile(value, 0.9, na.rm = TRUE),
+      q10 = quantile(value, 0.1, na.rm = TRUE),
+      n = length(value),
+      seq = paste(unique(seq), collapse = "\n"),
+      idtemp = .GRP,
+      id = .GRP
+    ), .(cl, variable)]
+    print(dim(me))
+  }
+
+  cbp <- colorRampPalette(cbPalette)(max(as.character(me$cl)))
+  cbp <- c("#73FDFF", cbp)
+  alphaset <- NULL
+
+  if (PurePlot) {
+    cbp <- "#A9A9A9"
+    me$color <- cbp
+    me$name <- ""
+    me$legendgroup <- ""
+    me$match <- 0
+
+    if (length(colorClusters) > 0) {
+      sel <- !is.na(match(me$cl, colorClusters))
+      me$color <- sel
+      me$match <- as.numeric(sel)
+      cbp <- c(cbp, "tomato")
+      alphaset <- 0.7
+    }
+
+    if (length(colorSequences) > 0) {
+      sel <- !is.na(match(me$seq, colorSequences))
+      me$match <- as.numeric(sel)
+      me$color <- sel
+      cbp <- c(cbp, "tomato")
+      alphaset <- 0.7
+      me$alphaset <- c(0.2, 1)[as.numeric(sel) + 1]
+    }
+  } else {
+    me$color <- cbp[as.numeric(as.character(me$cl)) + 1]
+  }
+
+  if (ShowQuantiles && MeanCluster) {
+    me$q90 <- me$q90 - me$value
+    me$q10 <- me$value - me$q10
+  } else {
+    me$q90 <- NA
+    me$q10 <- NA
+  }
+
+  me <- me[order(match, decreasing = FALSE)]
+  meleftover <- me[match != 0]
+
+  if (any(me$match > 0)) {
+    clvec <- c(unique(me[match == 0]$cl), unique(me[match > 0]$cl))
+    colvec <- c(unique(me[match == 0]$color), unique(me[match > 0]$color))
+    me$cl <- factor(me$cl, clvec)
+    me$color <- factor(me$color, colvec)
+  }
+
+  me <- me[match == 0]
+
+  p <- plot_ly(
+    me,
+    x = ~variable,
+    y = ~value,
+    color = ~color,
+    name = ~cl,
+    legendgroup = ~cl,
+    type = "scatter",
+    mode = "lines",
+    hoverinfo = "text",
+    text = me,
+    colors = cbp,
+    line = list(width = 3),
+    alpha = alphaset,
+    error_y = list(
+      type = "data",
+      symmetric = FALSE,
+      array = ~q90,
+      arrayminus = ~q10,
+      width = 2
+    )
+  ) %>%
+    layout(showlegend = TRUE)
+
+  try(p <- p %>% style(showlegend = FALSE, traces = idRemove), silent = TRUE)
+
+  if (nrow(meleftover) > 0) {
+    p <- p %>% add_trace(
+      x = meleftover$variable,
+      y = meleftover$value,
+      color = meleftover$color,
+      name = meleftover$cl,
+      legendgroup = meleftover$cl,
+      type = "scatter",
+      mode = "lines",
+      hoverinfo = "text",
+      text = meleftover$seq,
+      colors = cbp,
+      line = list(width = 3),
+      alpha = 1,
+      error_y = list(
+        type = "data",
+        symmetric = FALSE,
+        array = meleftover$q90,
+        arrayminus = meleftover$q10,
+        width = 2
+      ),
+      toback = TRUE
+    )
+  }
+
+  p <- p %>%
+    layout(
+      title = ens,
+      xaxis = list(title = "MW converted fraction"),
+      yaxis = list(title = "zscore"),
+      legend = list(title = list(text = "hdbscan results")),
+      showlegend = showlegend
+    )
+
+  me$Group <- as.character(me$cl)
+
+  if (!PurePlot) {
+    g2 <- ggplot(me[!is.na(variable) & cl != 0 & cl != -1], aes(as.numeric(variable) / 1000, value, group = id, color = Group)) +
+      geom_line()
+  } else {
+    g2 <- ggplot(me[!is.na(variable) & cl != 0 & cl != -1], aes(as.numeric(variable) / 1000, value, group = id)) +
+      geom_line(color = "black", alpha = 0.5, lwd = 1)
+  }
+
+  list(p = p, data = me, clusterColors = cbp, g2 = g2)
+}
+
+#------------------------------------------------------------------------------
+# Base ggplot version of the trace plot
+#------------------------------------------------------------------------------
+Traces_GGplot <- function(input, ens = "ENSG00000120802", mpwcutoff = 0, converttoMW = TRUE, PurePlot = TRUE, showlegend = FALSE) {
+  hdb <- input$hdbscanTables[EnsG == ens]
+  tempValues <- input$TMTSubset_final_singlenorm_zscore[hdb$id, ]
+
+  tempValues$cl <- hdb$cl_2
+  tempValues$id <- hdb$id
+
+  if (any(grepl("^V[0-9]", colnames(tempValues)[1]))) {
+    me <- melt(tempValues, measure.vars = paste("V", 1:28, sep = ""), id.vars = c("cl", "id"))
+    me$variable <- as.numeric(gsub("V", "", me$variable))
+  } else {
+    me <- melt(tempValues, measure.vars = 2:29, id.vars = c("cl", "id"))
+  }
+
+  if (length(input$MW_Predictor) > 0 && converttoMW) {
+    md <- input$MW_Predictor
+    mds <- 10^predict(md, 2:29)
+    me$variable <- mds[match(me$variable, 2:29)]
+  }
+
+  if (PurePlot) {
+    g2 <- ggplot(me, aes(as.numeric(variable), value, group = id, color = as.character(cl))) +
+      geom_line(color = "black")
+  } else {
+    g2 <- ggplot(me, aes(as.numeric(variable), value, group = id, color = as.character(cl))) +
+      geom_line()
+  }
+
+  list(p = g2 + xlab("MW") + ylab("zscore") + ggtitle(ens), data = me, clusterColors = NA)
+}
+
+#------------------------------------------------------------------------------
+# Draw sequence letters underneath cluster-colored positions
+#------------------------------------------------------------------------------
+plot.sequence <- function(IFUN, selected = IFUN$ENSEMBL_PROTEIN[1], ClustColor = NULL, ProtSequence = NULL) {
+  ClustColor <<- ClustColor
+  IFUN <<- IFUN
+  selected <<- selected
+  ProtSequence <<- ProtSequence
+
+  it <- 1
+  IFUN$Sequence <- IFUN$Seq
+  IFUN$Cluster <- IFUN$cl_2
+
+  ClustColorMatch <- ClustColor[match(IFUN$Cluster, ClustColor$cluster2), ]
+  IFUN$Color <- ClustColorMatch$Color
+
+  if (length(IFUN$Color) == 0) {
+    IFUN$Color <- "grey"
+    IFUN$color <- "grey"
+  }
+
+  IFUN$Peaks <- ClustColorMatch$V1
+
+  Positions <- IFUN[, {
+    sequ <- .BY$Sequence
+    gr <- gregexpr(sequ, ProtSequence, fixed = TRUE)
+    Posis <- gr[[1]]:(gr[[1]] + attributes(gr[[1]])$match.length - 1)
+    data.table(Position = Posis)
+  }, .(Sequence, Cluster, Color)]
+
+  Positions$Color[is.na(Positions$Color)] <- "black"
+  Positions <- Positions[, .(co = paste(unique(Color), collapse = ";"), cl = paste(unique(Cluster), collapse = ";")), Position]
+  Positions <- Positions[Position > 0 & !is.na(Position)]
+
+  LE <- strsplit(ProtSequence, "")
+  maxLe <- 40
+  yrow <- ceiling(length(LE[[1]]) / maxLe)[it]
+
+  vec <<- rep(0, yrow * maxLe)
+  vec[Positions$Position] <- Positions$cl
+  try({
+    vec <- as.numeric(factor(as.character(vec), unique(vec), 1:length(unique(vec))))
+  })
+  vec[is.na(vec)] <- 0
+  vec <<- vec
+
+  MA <- matrix(rev(vec), nrow = yrow, ncol = maxLe, byrow = TRUE)
+  MA <- apply(MA, 1, rev)
+
+  par(mai = c(0.8, 0.1, 0.5, 2))
+  image(MA, main = "", col = c("#FFFFFF", ClustColor$Color), axes = FALSE)
+  mtext(selected, 3, line = 1)
+
+  ClustColorLeg <- unique(ClustColor)
+  ClustColorLeg$cluster2 <- NULL
+
+  legend(
+    par()$usr[2], par()$usr[4],
+    xjust = 0,
+    legend = c(as.character(ClustColorLeg$V1), ">x"),
+    fill = c(ClustColorLeg$Color, "#33333340"),
+    xpd = NA,
+    bty = "n",
+    cex = 0.8
+  )
+
+  legend(
+    par()$usr[1], par()$usr[3],
+    xjust = 0,
+    legend = c(as.character(ClustColorLeg$V1), ">x"),
+    fill = c(ClustColorLeg$Color, "#33333340"),
+    horiz = TRUE,
+    xpd = NA,
+    bty = "n"
+  )
+
+  y <<- 0
+  x <<- 0
+  sapply(seq_along(LE[[it]]), function(ite) {
+    text(x / (maxLe - 1), 1 - y / (yrow - 1), LE[[it]][ite], xpd = NA)
+    x <<- x + 1
+    if (x %% maxLe == 0) {
+      y <<- y + 1
+      x <<- 0
+    }
+  })
+}
+
+#------------------------------------------------------------------------------
+# Map peptide evidence from a plot object onto protein sequences
+#------------------------------------------------------------------------------
+MappedProteinSequences <- function(P, IDs, TotalWidth = 50) {
+  P$data$Sequence <- P$data$seq
+  P$data$Cluster <- P$data$cl
+  P$data$Color <- P$data$cl
+
+  MappedData <- lapply(seq_len(nrow(IDs)), function(it) {
+    ProtSequence <- IDs$SEQUENCE[it]
+    P$data$SequenceComparisson <- ProtSequence
+
+    singlefun <- strsplit(ProtSequence, "")
+    dt <- data.table(
+      Sequence = "",
+      Cluster = -1,
+      Color = -1,
+      Position = seq_along(unlist(singlefun)),
+      AA = unlist(singlefun),
+      ProtSequence = ProtSequence
+    )
+
+    Positions <- P$data[, {
+      sequ <<- .BY$Sequence
+      gr <- gregexpr(sequ, ProtSequence, fixed = TRUE)
+      Posis <- gr[[1]]:(gr[[1]] + attributes(gr[[1]])$match.length - 1)
+      data.table(Position = Posis)
+    }, .(Sequence, Cluster, Color)]
+
+    po <- Positions$Position
+    po[po < 1] <- NA
+    Positions$ProtSequence <- ProtSequence
+    Positions$AA <- singlefun[[1]][po]
+
+    PositionsCombi <- rbind(dt, Positions)
+    PositionsCombi$ProtName <- IDs$ProteinID[it]
+    PositionsCombi
+  })
+
+  MappedData <- rbindlist(MappedData)
+  MappedData$Color[is.na(MappedData$Color)] <- -1
+
+  # Lay out positions in rows of fixed width
+  MappedDataAdjusted <- MappedData[, {
+    temp <- .SD
+    temp <- temp[!is.na(temp$AA)]
+    Row <- ceiling(temp$Position / TotalWidth)
+    Col <- temp$Position - TotalWidth * (Row - 1)
+    temp$x <- Col
+    temp$y <- Row
+    temp
+  }, .(ProtSequence, ProtName)]
+
+  MappedDataAdjusted
+}
+
+# Helper Function, extracts x and y ranges from ggplot objects
+get_ggplot_ranges <- function(p){
+  b <- ggplot_build(p)
+  
+  lapply(b$layout$panel_params, function(x){
+    list(
+      x = x$x.range,
+      y = x$y.range
+    )
+  })
+}
+```
+
+
+## SimilarityTables across all Gels
+
+Similar to the UniProt based peak assignment, this chunk builds the cross-gel similarity analysis used for the manuscript figure 4 with the PACBIO database instead of UniProt database. It prepares a non-redundant protein sequence table, combines the compressed peak assignments across gels, and then runs the enrichment-based network assignment step for every gene. 
+
+```{r,cache=F}
+## SimilarityTables across all gels
+## Enrichment analysis of peptides across all UniProt entries for each gene
+
+# Inspect search specificity across gels
+lapply(
+  TableListNormEnsHdbScanMW_Peaks,
+  function(x) table(x$InputTable$SearchSpecificity)
+)
+
+# Use PacBIO sequences as the protein sequence reference
+ProteinSequences <- PacBIO
+
+# Only keep high-confidence IsoFrac peak identities
+ipr_PeakIdentity <- Results_CombinedGels$Compressed_Pairs[AboveZscore == TRUE]
+
+# Output / cache settings
+outfilestr <- "PacBio_Enrichment"
+rerun <- TRUE
+rdaName <- "ENSG_Similarity_AllGelsCombined_PacBioEnrichment_woSemiTryptic.rda"
+
+if (!file.exists(rdaName) | rerun) {
+  unlink(outfilestr)
+  gc()
+
+  # Collect HDBSCAN tables across all gels
+  hdbscanList <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x) {
+    gel <- x$xname
+    x$hdbscanTables$gel <- gel
+    x$hdbscanTables
+  })
+  hdbscan <- rbindlist(hdbscanList, fill = TRUE)
+
+  # Parallel enrichment across genes
+  threads <- 50
+  cl <- makeCluster(threads, outfile = outfilestr)
+
+  input <- ipr_PeakIdentity[AboveZscore == TRUE]
+  ENSG <- unique(ipr_PeakIdentity$ENS)
+  zscoreCutoff <- c(0, 0.5)
+
+  # Export required objects and helper functions to workers
+  ProteinSequencesCategories <- ProteinSequences
+  clusterExport(
+    cl,
+    c(
+      "ProteinSequences",
+      "ProteinSequencesCategories",
+      "input",
+      "zscoreCutoff",
+      "hdbscan",
+      "traces_info_crawler_compressed_gels",
+      "nw_plot",
+      "NetworkEnrichment",
+      "nw_assembler_compressed_gels",
+      "ENSG",
+      "hyper_equal_or_more"
+    )
+  )
+
+  # Run the enrichment wrapper for every ENSG
+  ENSG_Similarity_PacBIO <- parLapply(
+    cl,
+    ENSG,
+    Network_DB_Enrichment_Wrapper_old,
+    UseRandomPeak = FALSE,
+    RemoveFalseRandoms = FALSE
+  )
+
+  names(ENSG_Similarity_PacBIO) <- ENSG
+
+  # Save results for reuse
+  stopCluster(cl)
+  save(ENSG_Similarity_PacBIO, file = rdaName)
+
+} else {
+  load(rdaName)
+}
+
+```
+
+## -> Trains Based on gbm UniProt Model
+
+This section loads the pre-trained GBM (UniProt) model, scores both the UniProt and PacBIO candidate tables, assigns the GBM score as the reference score, combines both datasets for downstream comparison, and saves the updated result objects for later use.
+
+```{r}
+## Train GBM scoring model on the UniProt reference and score both datasets
+
+library(h2o)
+h2o.init()
+
+# Load the pre-trained UniProt GBM model if it is not already in memory
+if (!exists("gbmodel_UP")) {
+  gbmodel_UP <- h2o.import_mojo("./CombinedGels_UniProtAssignmentModelgbm/")
+}
+
+# Add a simple UniProt fraction feature used by the model
+AddTotalUniprotFraction <- function(x) {
+  x$TotalUniprotFraction <- as.numeric(x$All_Uniprot_Peptides) / as.numeric(x$all_sequences)
+  x
+}
+
+Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio <-
+  AddTotalUniprotFraction(Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio)
+
+Results_CombinedGels$Pairs_Unfiltered <-
+  AddTotalUniprotFraction(Results_CombinedGels$Pairs_Unfiltered)
+
+# Helper to predict scores with an H2O model
+PredictScores <- function(x, md) {
+  x <- copy(x)
+  names(x) <- make.unique(names(x))
+  x$V1 <- NULL
+  xh <- as.h2o(x)
+  as.data.frame(predict(md, xh))$predict
+}
+
+# Prepare UniProt table for scoring
+Results_CombinedGels$Pairs_Unfiltered_combi <- copy(Results_CombinedGels$Pairs_Unfiltered)
+Results_CombinedGels$Pairs_Unfiltered_combi$score_ref_gbm <- NULL
+Results_CombinedGels$Pairs_Unfiltered_combi$score_ref <- NULL
+
+# Score UniProt candidates
+Results_CombinedGels$Pairs_Unfiltered_combi$score_UP_gb <-
+  PredictScores(Results_CombinedGels$Pairs_Unfiltered, gbmodel_UP)
+
+# Prepare PacBIO table for scoring
+Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio$score_ref <- NULL
+
+# Score PacBIO candidates
+Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio$score_UP_gb <-
+  PredictScores(Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio, gbmodel_UP)
+
+table(is.na(Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio$score_UP_gb))
+
+# Use GBM as the reference score source
+ReferenceScore <- "GBM"
+
+if (ReferenceScore == "GBM") {
+  Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio$score_ref <-
+    Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio$score_UP_gb
+
+  Results_CombinedGels$Pairs_Unfiltered$score_ref <-
+    Results_CombinedGels$Pairs_Unfiltered$score_ref_gbm
+}
+
+# Tag the origin of each table
+Results_CombinedGels$Pairs_Unfiltered_combi$DataType <- "UP"
+Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio$DataType <- "PB"
+
+# Combine both datasets for downstream comparison
+CombiScoreTable <- rbind(
+  Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio,
+  Results_CombinedGels$Pairs_Unfiltered_combi,
+  fill = TRUE
+)
+
+table(CombiScoreTable$DataType)
+
+# Save updated objects
+save(Results_CombinedGels, file = "Results_CombinedGels.rda")
+save(Results_CombinedGels_PacBio, file = "Results_CombinedGels_PacBio.rda")
+
+``` 
+
+## ROC Combi
+
+This section evaluates how well the combined PacBIO/UniProt model separates forward (fw) from reverse (rv) hits using ROC curves. It builds ROC analyses for the main ranking features (dhyper_p, overlap measures, and the GBM score), estimates AUC stability by bootstrap resampling, and stores both the ROC curves and AUC summaries for plotting and downstream use.
+
+```{r ROC allGels before filtering}
+## ROC analysis for combined datasets (PacBIO + UniProt)
+
+# Combine filtered results from different scoring strategies
+BestMatchdt <- rbindlist(Results_CombinedGels_PBUP$Pairs_Filtered_list)
+
+# --------------------------------------------------
+# Function: Generate ROC curves for selected features
+# --------------------------------------------------
+RocGenerator <- function(FeatureInput,
+                         SelectedColumns = c("dhyper_p",
+                                             "IsofracOverlap",
+                                             "UniprotOverlap",
+                                             "all_sequences",
+                                             "type",
+                                             "score_ref_PacBIO")) {
+  
+  # Subset relevant features
+  FeatureSelect <- FeatureInput[, .SD, .SDcols = SelectedColumns]
+  
+  # Rename columns for readability
+  setnames(
+    FeatureSelect,
+    c("dhyper_p", "IsofracOverlap", "UniprotOverlap", "score_UP_gb"),
+    c("Overlap", "Coverage Isofrac", "Coverage Uniprot", "ML Score")
+  )
+  
+  # Define binary classification (fw = TRUE positives)
+  typevec <- FeatureSelect$type == "fw"
+  FeatureSelect$type <- NULL
+  
+  # Counter for feature names
+  it <- 0
+  
+  # --------------------------------------------------
+  # Compute ROC curves per feature
+  # --------------------------------------------------
+  rocs <- apply(FeatureSelect, 2, function(x) {
+    
+    it <<- it + 1
+    
+    # ROC calculation
+    pos <- pROC::roc(typevec, as.numeric(x))
+    
+    # Bootstrap AUC estimation (10 iterations)
+    aucs <- sapply(1:10, function(i) {
+      sa <- sample(seq_along(x), length(x), replace = TRUE)
+      
+      if (length(unique(typevec[sa])) == 2) {
+        pos_bs <- pROC::roc(typevec[sa], as.numeric(x[sa]))
+        return(pos_bs$auc)
+      } else {
+        return(NA_real_)
+      }
+    })
+    
+    # Return ROC object + AUC statistics
+    list(
+      q = quantile(aucs, probs = c(0.05, 0.5, 0.95), na.rm = TRUE),
+      pos = pos,
+      feature = colnames(FeatureSelect)[it]
+    )
+  })
+  
+  # Convert ROC curves into plotting table
+  rocs_d <- rbindlist(lapply(rocs, function(x) {
+    data.table(
+      Specificity = x$pos$specificities,
+      Sensitivity = x$pos$sensitivities,
+      feature = paste(x$feature, round(x$pos$auc, 2))
+    )
+  }))
+  
+  return(rocs_d)
+}
+
+# --------------------------------------------------
+# Generate ROC curves using GBM score
+# --------------------------------------------------
+ROCSall <- lapply(c("score_UP_gb"), function(score_col) {
+  
+  ROC_Combi <- RocGenerator(
+    CombiScoreTable,
+    SelectedColumns = c("dhyper_p",
+                        "IsofracOverlap",
+                        "UniprotOverlap",
+                        "type",
+                        score_col)
+  )
+  
+  ROC_Combi$ROC_TYPE <- score_col
+  ROC_Combi
+})
+
+names(ROCSall) <- c("score_UP_gb")
+
+# --------------------------------------------------
+# Plot ROC curves
+# --------------------------------------------------
+ROCplot <- function(x) {
+  
+  # Order features for consistent plotting
+  x$feature <- factor(
+    x$feature,
+    c(
+      grep("Isofrac", x$feature, value = TRUE)[1],
+      grep("Uniprot", x$feature, value = TRUE)[1],
+      grep("Overlap", x$feature, value = TRUE)[1],
+      grep("Score", x$feature, value = TRUE)[1]
+    )
+  )
+  
+  ggplot(x, aes(Specificity, Sensitivity, color = feature)) +
+    geom_line(linewidth = 1) +
+    xlim(1, 0) +                                 # reverse axis (ROC style)
+    geom_abline(slope = 1, intercept = 1, lty = "dotted") +
+    facet_wrap("ROC_TYPE")
+}
+
+# Save ROC plots
+pdf("ROCS.pdf", width = 10)
+do.call(plot_grid, lapply(ROCSall, ROCplot))
+dev.off()
+
+system("open ROCS.pdf")
+
+# --------------------------------------------------
+# Compute AUC using trapezoidal integration
+# --------------------------------------------------
+ROCSalldt <- rbindlist(ROCSall)
+
+library(pracma)
+
+BP_AUC <- ROCSalldt[, {
+  trapz(Specificity, Sensitivity)
+}, by = .(ROC_TYPE, feature)]
+
+# Store AUC summary
+Results_CombinedGels_PBUP$ROC_BP <- list(
+  table = ROCSalldt,
+  gg = ggplot(BP_AUC, aes(feature, V1, fill = ROC_TYPE)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+)
+
+# --------------------------------------------------
+# Clean ROC table for final plotting
+# --------------------------------------------------
+ROCtable <- ROCSall$score_UP_gb[
+  !grepl("all_sequences", feature)
+]
+
+ROCtable$feature <- gsub("UniprotOverlap", "Database Overlap", ROCtable$feature)
+
+# Final ROC plot
+Results_CombinedGels_PBUP$ROC <- ggplot(
+  ROCtable,
+  aes(Specificity, Sensitivity, color = feature)
+) +
+  geom_line() +
+  xlim(1, 0) +
+  geom_abline(slope = 1, intercept = 1, lty = "dotted")
+
+# Save results
+save(Results_CombinedGels_PBUP, file = "Results_CombinedGels_PBUP.rda")
+save(ROCSall, file = "ROCSall.rda")
+
+```
+
+## PACBIO vs UniProt: Comparative Isoform Assignment and Delta Mass-Based Classification
+
+This section compares PacBIO and UniProt assignments after harmonizing the combined result tables. For each isoform pair, the best UniProt and PacBIO scores were extracted, and only high-confidence cases were retained using a score threshold of 0.8. Delta masses for UniProt and PacBIO candidates were then compared, and each pair was assigned to one of several interpretation bins based on whether the masses agreed, differed in sign, or fell near the diagonal in an orthogonal distance framework. Protein-level annotations were mapped back to UniProt category labels and condensed into broader isoform classes. The resulting tables were used to summarize database-specific isoform counts, score ratios, delta-mass categories, and enrichment of UniProt and PacBIO category types with hypergeometric testing, with multiple-testing correction applied by BH adjustment.
+
+```{r}
+## ->> Trying with orthogonal distance calculation Ran on 20260312
+
+if (!exists("plotCollecter")) {
+  plotCollecter <- list()
+}
+
+if (!exists("Results_CombinedGels_PBUP")) {
+  load("Results_CombinedGels_PBUP.rda")
+}
+
+if (!exists("dt_gn_uni")) {
+  dt_gn_uni <- Extracting_DT_GN_UNI(TableListNormEnsHdbScanMW_Peaks)
+}
+
+# -------------------------------------------------------------------
+# Prepare combined UP / PB table
+# -------------------------------------------------------------------
+UP <- Results_CombinedGels$Pairs_Filtered
+UP$Database <- "UNIPROT"
+
+PB <- Results_CombinedGels_PBUP$Pairs_Filtered
+PB$Database <- "PACBIO"
+
+UPPB <- rbind(UP[type == "fw"], PB[type == "fw"], fill = TRUE)
+
+# Fill missing labels for PacBIO-only runs
+UPPB$label[is.na(UPPB$label)] <- "PACBIO Run"
+
+# Overview plots for how many entries come from each database / category
+plotCollecter$PBUP_IsoFormCountCategories_label <-
+  ggplot(UPPB[type == "fw"], aes(label, fill = DataType)) +
+  geom_bar(stat = "count", position = "stack") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+plotCollecter$PBUP_IsoFormCountCategories <-
+  ggplot(UPPB[type == "fw"], aes(Database, fill = DataType)) +
+  geom_bar(stat = "count", position = "stack") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+plotCollecter$PBUP_IsoFormCountCategories$Caption <-
+  "Protein isoform counts across identification categories using either PacBIO (PB) or UniProt (UP). PB increases the number of single-candidate hits due to database specificity."
+
+plotCollecter$PBUP_IsoFormCountCategoriesBoxplots <-
+  ggplot(UPPB[type == "fw" & !is.na(score_UP_gb_PB)],
+         aes(label, as.numeric(score_UP_gb_PB), fill = DataType)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+plotCollecter$PBUP_IsoFormCountCategoriesBoxplots$Caption <-
+  "Boxplots between PB and UP within different isoform-quality bins."
+
+# -------------------------------------------------------------------
+# Build row-wise comparison table for downstream distance / category logic
+# -------------------------------------------------------------------
+RowWiseCompare <- Results_CombinedGels_PBUP$Pairs_Filtered[type == "fw"]
+
+# Carry over UniProt isoform category from the UniProt-only table
+RowWiseCompare$Uniprot_Isoform_Category <-
+  Results_CombinedGels$Pairs_Filtered$UniProt_Category[
+    match(RowWiseCompare$Uniprot, Results_CombinedGels$Pairs_Filtered$Uniprot)
+  ]
+
+# Mark rows with unassigned UniProt category as PACBIO
+RowWiseCompare$Uniprot_Isoform_Category[!is.na(RowWiseCompare$Uniprot_Isoform_Category)] <- "PACBIO"
+
+# Add gene symbol
+RowWiseCompare$hgnc <- dt_gn_uni$uni_hgnc[match(RowWiseCompare$ENSG, dt_gn_uni$ens)]
+
+# Parse best score values from semicolon-separated score fields
+RowWiseCompare$score_ref_Uniprot <-
+  sapply(strsplit(RowWiseCompare$score_UP_gb_UP, ";"),
+         function(x) max(as.numeric(x), na.rm = TRUE))
+
+RowWiseCompare$score_ref_PacBIO <-
+  sapply(strsplit(RowWiseCompare$score_UP_gb_PB, ";"),
+         function(x) max(as.numeric(x), na.rm = TRUE))
+
+# Thresholds used later
+scoreCutoff <- c(0.8, 2)
+dmDiff <- 10000
+
+RowWiseCompare$CombiScore_Uniprot <- as.numeric(RowWiseCompare$score_ref_Uniprot)
+RowWiseCompare$Combiscore_ref      <- as.numeric(RowWiseCompare$score_ref_PacBIO)
+
+# Keep only high-confidence rows
+score_Ref_cutoff <-
+  (RowWiseCompare$CombiScore_Uniprot > scoreCutoff[1] |
+   RowWiseCompare$Combiscore_ref      > scoreCutoff[1]) &
+  (RowWiseCompare$CombiScore_Uniprot < scoreCutoff[2] &
+   RowWiseCompare$CombiScore_Uniprot < scoreCutoff[2])
+
+score_Ref_cutoff[is.na(score_Ref_cutoff)] <- FALSE
+
+# -------------------------------------------------------------------
+# Orthogonal distance regression between PB and UP delta masses
+# -------------------------------------------------------------------
+RowWiseCompare$Label <-
+  paste(RowWiseCompare$hgnc_symbol,
+        round(as.numeric(RowWiseCompare$IsoFrac_MW) / 1000),
+        RowWiseCompare$Uniprot_Uniprot,
+        RowWiseCompare$Uniprot,
+        sep = "\n")
+
+naorinf <- function(x) is.na(x) | is.infinite(x)
+
+sel <- naorinf(RowWiseCompare$DM_PB_min) | naorinf(RowWiseCompare$DM_UP_min)
+y   <- RowWiseCompare$DM_UP_min[!sel]
+x   <- RowWiseCompare$DM_PB_min[!sel]
+
+# Repeat points to stabilize the orthogonal regression fit
+x <- c(x, y, y, y, y, y)
+y <- c(y, y, y, y, y, y)
+
+library(pracma)
+odifun <- odregress(x = x, y = y)
+
+RowWiseCompare$Residuals <- NA
+RowWiseCompare$Residuals[!sel] <- odifun$resid[1:(length(x) / 6)]
+
+# -------------------------------------------------------------------
+# Define delta-mass categories
+# -------------------------------------------------------------------
+lmcheck <- function(x, y, n1, m1, n2, m2) {
+  y1 <- m1 * x + n1
+  y2 <- m2 * x + n2
+  yall <<- sort(c(y1, y2))
+  y > y1 & y < y2
+}
+
+a <- RowWiseCompare$DM_UP_min
+b <- RowWiseCompare$DM_PB_min
+
+windowSize <- dmDiff
+fac <- 1.4
+
+Dia      <- lmcheck(a, b, -windowSize * fac,  1, windowSize * fac,  1)
+AntiDia  <- lmcheck(a, b, -windowSize * fac, -1, windowSize * fac, -1)
+xequal   <- lmcheck(a, b, -windowSize, 0, windowSize, 0)
+yequal   <- (a > -windowSize) & a < windowSize
+
+DiffCategory <- paste(as.numeric(Dia),
+                      as.numeric(AntiDia),
+                      as.numeric(xequal),
+                      as.numeric(yequal),
+                      sep = "")
+
+point_in_circle <- function(x, y, radius) {
+  sqrt(x^2 + y^2) <= radius
+}
+
+DiffCategoryNew <- "other"
+WithinCircle <- point_in_circle(a, b, windowSize * 1.5)
+
+DiffCategoryNew[DiffCategory == "1000" & !WithinCircle & a > 0 & b > 0] <- "Equal MassShift+"
+DiffCategoryNew[DiffCategory == "1000" & !WithinCircle & a < 0 & b < 0] <- "Equal MassShift-"
+
+DiffCategoryNew[!WithinCircle & DiffCategory == "0010" & a > 0] <- "PACBIO correct+"
+DiffCategoryNew[!WithinCircle & DiffCategory == "0001" & b > 0] <- "UniProt correct+"
+DiffCategoryNew[!WithinCircle & DiffCategory == "0010" & a < 0] <- "PACBIO correct-"
+DiffCategoryNew[!WithinCircle & DiffCategory == "0001" & b < 0] <- "UniProt correct-"
+
+DiffCategoryNew[is.na(DiffCategoryNew)] <- "Other"
+DiffCategoryNew[WithinCircle] <- "Correct Mass"
+
+RowWiseCompare$Categories_Uniprot_Uniprot_fixed <- NULL
+RowWiseCompare$DM_min_categories <- DiffCategoryNew
+
+# -------------------------------------------------------------------
+# Match each UniProt accession back to ProteinSequencesCategories
+# -------------------------------------------------------------------
+UPsplit <- strsplit(RowWiseCompare$Uniprot, ";")
+
+if (!exists("UP_L_CombiScores") | 0) {
+  load("ProteinSequencesCategories.rda")
+  PSCnames <- names(ProteinSequencesCategories)
+
+  # If needed, append PacBIO entries to the protein sequence table
+  if (all(!grepl("ENSG", ProteinSequencesCategories$ProteinID))) {
+    print("HU")
+    ProteinSequencesCategories <- rbind(ProteinSequencesCategories, PacBIO, fill = TRUE)
+  }
+
+  ProteinSequencesCategories <- ProteinSequencesCategories[, .SD, .SDcols = PSCnames]
+
+  UP_L_CombiScores <- lapply(UPsplit, function(x) {
+    x <<- x
+    x <- gsub(" # .*.", "", x)
+    xtemp <- ProteinSequencesCategories[match(x, ProteinID)]
+
+    if (dim(xtemp)[1] > 1) {
+      xtemp <- apply(xtemp, 2, function(y) {
+        y <- gsub("^ ", "", y)
+        if (all(!is.na(as.logical(y)))) {
+          any(as.logical(y))
+        } else {
+          paste(unique(y), collapse = ";")
+        }
+      })
+
+      xtemp <- data.table(xtemp)
+      xtemp <- t(xtemp)
+      xtemp <- as.data.table(xtemp)
+      colnames(xtemp) <- colnames(ProteinSequencesCategories)
+
+      cleanedstring <- gsub("_.*.", "", lelu <- strsplit(xtemp$ID, ";")[[1]])
+      cleanedstring <- gsub("-.*.", "", cleanedstring)
+
+      if (length(unique(cleanedstring)) == 1) {
+        xtemp$Multimapper <- FALSE
+        xtemp$Variants <- length(cleanedstring)
+      } else {
+        xtemp$Multimapper <- TRUE
+        xtemp$Variants <- length(lelu)
+      }
+    } else {
+      xtemp$Multimapper <- FALSE
+      xtemp$Variants <- 1
+    }
+
+    xtemp
+  })
+
+  UP_L_CombiScoresList <- UP_L_CombiScores
+}
+
+UP_L_CombiScores <- lapply(UP_L_CombiScoresList, function(x) {
+  if (dim(x)[1] == 0) {
+    x <<- x
+    x <- rbind(x, "", fill = TRUE)
+  }
+  x
+})
+
+UP_Matched <- rbindlist(UP_L_CombiScores, fill = TRUE)
+
+# Pull through UniProt-based isoform category annotations
+RowWiseCompare$Uniprot_Isoform_Category <-
+  Results_CombinedGels$Pairs_Filtered$Uniprot_Isoform_Category[
+    match(RowWiseCompare$Uniprot, Results_CombinedGels$Pairs_Filtered$Uniprot)
+  ]
+# Refine annotations
+RowWiseCompare$Categories_Uniprot_Uniprot_fixed <- RowWiseCompare$Uniprot_Isoform_Category
+RowWiseCompare$Categories_Uniprot_Uniprot_fixed[RowWiseCompare$Categories_Uniprot_Uniprot_fixed == "AS; AS"] <- "AS"
+RowWiseCompare$Categories_Uniprot_Uniprot_fixed[RowWiseCompare$Categories_Uniprot_Uniprot_fixed == "AS; Processing; AS"] <- "AS; Processing"
+RowWiseCompare$Categories_Uniprot_Uniprot_fixed[RowWiseCompare$Categories_Uniprot_Uniprot_fixed == "Processing; AS"] <- "AS; Processing"
+
+# -------------------------------------------------------------------
+# Compare model scores across delta-mass categories
+# -------------------------------------------------------------------
+CombiScoreList <- list(
+  CombiScores = c("score_ref_rf_PB", "score_ref_rf_UP")
+)
+
+# -------------------------------------------------------------------
+# UniProt isoform type annotations
+# -------------------------------------------------------------------
+RowWiseCompare$UniprotIsoformType <-
+  Results_CombinedGels$Pairs_Filtered[type == "fw"]$UniProt_Category_Clean[
+    match(RowWiseCompare$Uniprot, Results_CombinedGels$Pairs_Filtered[type == "fw"]$Uniprot)
+  ]
+
+convert_UniprotIsoformType <- function(x, Type = "none") {
+  if (Type != "none") {
+    factor(
+      x,
+      c("AS", "Canonical", "Multiple Categories", "No Variant",
+        "Shorter Variant (SV)", "Trembl", "UNKNOWN"),
+      c("AS", "Diverse", "Diverse", "Diverse",
+        "Shorter Variant (SV)", "Diverse", "Diverse")
+    )
+  } else {
+    factor(
+      x,
+      c("AS", "No Variant", "Multiple Categories", "Shorter Variant", "Trembl", "UNKNOWN"),
+      c("AS", "Diverse", "Diverse", "Shorter Variant (SV)", "Diverse", "Diverse")
+    )
+  }
+}
+
+RowWiseCompare$UniprotIsoformType_Condensed <-
+  convert_UniprotIsoformType(RowWiseCompare$UniprotIsoformType)
+
+subset_table <- RowWiseCompare[(as.numeric(selectedScore_UP) > 0.8 | as.numeric(selectedScore_PB) > 0.8) & type == "fw"]
+subset_table$UniprotIsoformType <- subset_table$UniprotIsoformType_Condensed
+subset_table$UniprotIsoformType[is.na(subset_table$UniprotIsoformType)] <- "Diverse"
+
+# Scatter of delta masses between PB and UP
+gfu2 <-
+  ggplot(subset_table,
+         aes(DM_PB_min, DM_UP_min,
+             color = DM_min_categories,
+             label = paste(PACBIO_ACC, Uniprot))) +
+  geom_point() +
+  xlab("IsoFrac-PACBIO MW [D]") +
+  ylab("IsoFrac-UniProt MW [D]")
+
+gfu2_Counts <-
+  ggplot(subset_table, aes(DM_min_categories, fill = DM_min_categories)) +
+  geom_bar(stat = "count")
+
+Results_CombinedGels_PBUP$DM_plots <- list(DM = gfu2, counts = gfu2_Counts)
+
+# Score ratio by delta-mass category
+Results_CombinedGels_PBUP$Category_BP <-
+  ggplot(subset_table,
+         aes(DM_min_categories,
+             log2(as.numeric(score_UP_gb_UP) / as.numeric(score_UP_gb_PB)),
+             fill = DataType)) +
+  geom_boxplot(orientation = "x") +
+  ylab("UP/PB") +
+  coord_flip()
+
+Results_CombinedGels_PBUP$ProteinCategory_BP <-
+  ggplot(subset_table,
+         aes(Categories_Uniprot_Uniprot_fixed,
+             log2(as.numeric(score_UP_gb_UP) / as.numeric(score_UP_gb_PB)))) +
+  geom_boxplot(orientation = "x") +
+  ylab("UP/PB") +
+  coord_flip()
+
+# -------------------------------------------------------------------
+# Summary counts for database / isoform type bins
+# -------------------------------------------------------------------
+DB_counts <- RowWiseCompare[(score_UP_gb_UP > 0.8 | score_UP_gb_PB > 0.8) & type == "fw", {
+  ta <- table(UniprotIsoformType_Condensed)
+  list(Isoform_Type = names(ta),
+       count = as.vector(ta),
+       count_rel = as.vector(ta) / sum(as.vector(ta)))
+}, DataType]
+
+DB_counts[, p := {
+  temp <- .SD
+  blackPicked <- sum(temp$count)
+  AllCount <- sum(DB_counts$count)
+
+  ps <<- temp[, {
+    White    <- count
+    Black    <- blackPicked - White
+    AllWhite <- sum(DB_counts[DB_counts$Isoform_Type == .BY$Isoform_Type]$count)
+    AllBlack <- AllCount - AllWhite
+    hyper_equal_or_more(White, AllWhite, AllBlack, White + Black)
+  }, Isoform_Type]
+
+  ps$V1
+}, .(DataType)]
+
+DB_counts[, count_rel := count / sum(count), DataType]
+DB_counts$p.adjust <- p.adjust(DB_counts$p, "BH")
+DB_counts$p.adjust[DB_counts$p.adjust > 0.05] <- as.double(NA)
+
+add_Label <- function(gg, hj = 0, vj = 1, angle = 0, repel = TRUE, setdirection = "both") {
+  if (!repel) {
+    gg +
+      geom_label(aes(label = signif(p.adjust, 2)),
+                 position = position_stack(vjust = vj),
+                 hjust = hj, angle = angle, size = 2,
+                 show.legend = FALSE) +
+      guides(fill = guide_legend(override.aes = list(label = "", angle = angle)),
+             lwd = guide_legend(override.aes = list(lwd = NA))) +
+      theme(legend.title = element_blank())
+  } else {
+    gg +
+      geom_label_repel(aes(label = signif(p.adjust, 2)),
+                       position = position_stack(vjust = vj),
+                       hjust = hj, angle = angle, size = 2,
+                       direction = setdirection,
+                       show.legend = FALSE) +
+      guides(fill = guide_legend(override.aes = list(label = "", angle = angle))) +
+      theme(legend.title = element_blank())
+  }
+}
+
+if (class(DB_counts$DataType) != "factor") {
+  DB_counts$DataType <- factor(DB_counts$DataType,
+                               c("PB", "PB###UP", "UP"),
+                               c("PACBIO", "PACBIO\nand\nUniProt", "UniProt"))
+}
+
+Results_CombinedGels_PBUP$FractionOfIdentifed <-
+  ggplot(DB_counts, aes(DataType, count)) +
+  geom_bar(stat = "identity", position = "stack")
+
+Results_CombinedGels_PBUP$FractionOfIdentifed_rel <-
+  add_Label(
+    ggplot(DB_counts, aes(DataType, count_rel, fill = Isoform_Type)) +
+      geom_bar(stat = "identity", position = "stack"),
+    hj = 0.5, vj = c(0.5, 0.5, 0), repel = FALSE
+  )
+
+# Fractions by delta-mass category
+subset_table_counts <- subset_table[score_UP_gb_PB != score_UP_gb_UP, {
+  ta <- table(UniprotIsoformType_Condensed)
+  list(Isoform_Type = names(ta),
+       count = as.vector(ta),
+       count_rel = as.vector(ta) / sum(as.vector(ta)))
+}, DM_min_categories]
+
+subset_table_countsAll <- subset_table[, {
+  ta <- table(UniprotIsoformType_Condensed)
+  list(Isoform_Type = names(ta),
+       count = as.vector(ta),
+       count_rel = as.vector(ta) / sum(as.vector(ta)))
+}, ]
+
+subset_table_countsAll$DM_min_categories <- "ALL"
+
+subset_table_counts[, p := {
+  temp <- .SD
+  blackPicked <- sum(temp$count, na.rm = TRUE)
+  AllCount <- sum(subset_table_countsAll$count)
+
+  ps <<- temp[, {
+    White    <- count
+    Black    <- blackPicked - White
+    AllWhite <- subset_table_countsAll[subset_table_countsAll$Isoform_Type == .BY$Isoform_Type]$count
+    AllBlack <- AllCount - AllWhite
+    hyper_equal_or_more(White, AllWhite, AllBlack, White + Black)
+  }, Isoform_Type]
+
+  ps$V1
+}, .(DM_min_categories)]
+
+subset_table_counts$p.adjust <- p.adjust(subset_table_counts$p, "BH")
+subset_table_counts$p.adjust[subset_table_counts$p.adjust > 0.05] <- as.double(NA)
+
+Results_CombinedGels_PBUP$IsoformFractions <-
+  ggplot(rbind(subset_table_counts[grep("PACBIO", DM_min_categories, invert = TRUE)],
+               subset_table_countsAll, fill = TRUE),
+         aes(DM_min_categories, count_rel, fill = Isoform_Type)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  ylab("Fractions") +
+  xlab("") +
+  guides(fill = guide_legend(override.aes = list(shape = NA)))
+
+Results_CombinedGels_PBUP$IsoformFractions_ALL <-
+  ggplot(rbind(subset_table_counts, subset_table_countsAll, fill = TRUE),
+         aes(DM_min_categories, count_rel, fill = Isoform_Type)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  ylab("Fractions") +
+  xlab("") +
+  guides(fill = guide_legend(override.aes = list(shape = NA)))
+
+library(ggrepel)
+
+Results_CombinedGels_PBUP$IsoformFractions <-
+  Results_CombinedGels_PBUP$IsoformFractions +
+  geom_label_repel(aes(label = signif(p.adjust, 2)),
+                   position = position_stack(vjust = 1),
+                   hjust = 0, angle = 90, size = 2,
+                   direction = "x", show.legend = FALSE) +
+  guides(fill = guide_legend(override.aes = list(label = ""))) +
+  theme(legend.title = element_blank())
+
+Results_CombinedGels_PBUP$IsoformFractions_ALL <-
+  Results_CombinedGels_PBUP$IsoformFractions_ALL +
+  geom_label_repel(aes(label = signif(p.adjust, 2)),
+                   position = position_stack(vjust = 1),
+                   hjust = 0, angle = 90, size = 2,
+                   direction = "x") +
+  guides(fill = guide_legend(override.aes = list(label = ""))) +
+  theme(legend.title = element_blank())
+
+# -------------------------------------------------------------------
+# Add PacBio-specific categories
+# -------------------------------------------------------------------
+subset_table$PACBIO_Categories <- sapply(strsplit(subset_table$PACBIO_ACC, "ENSG"), function(x) {
+  x <<- x
+  x <- x[x != ""]
+  x <- gsub("#", "", x)
+  xi <- as.numeric(sapply(strsplit(x, " "), "[[", 2))
+  pb <- PacBIO[unique(xi)]$PacBioNames
+
+  if (any(is.na(pb))) {
+    stop()
+  }
+
+  paste(sort(unique(pb)), collapse = ";")
+})
+
+subset_table$Multiple <- grepl(";", subset_table$PACBIO_Categories)
+
+```
+
+## Updating SQLITE Database
+This section consolidates all IsoFrac analysis results into a structured SQLite database for downstream querying and visualization. It integrates PacBIO and UniProt assignments, per-gel clustering results, peak tables, and filtered isoform mappings into a unified schema. Additionally, a summarized isoform count table is generated to capture high-confidence isoform detections across experiments.
+
+```{r}
+
+## Updating SQLITE Database
+
+IsofracCandidates <- list.files(pattern = "IsoFrac_\\d")
+IsofracCandidates <- grep("7z$", IsofracCandidates, invert = TRUE, value = TRUE)
+
+# Pick the newest IsoFrac output directory
+pa <- sort(IsofracCandidates, decreasing = TRUE)[1]
+setwd(pa)
+
+library(RSQLite)
+
+dbpath <- "./TableListNormEnsHdbScanMW_Peaks.sqlite"
+
+if (file.exists(dbpath)) {
+  db <- dbConnect(SQLite(), dbpath)
+  dbListTables(db)
+
+  ## --------------------------------------------------
+  ## 1) Write combined PacBIO / UniProt tables
+  ## --------------------------------------------------
+  Results_CombinedGels_PBUP$Pairs_Unfiltered$V1 <- NULL
+  names(Results_CombinedGels_PBUP$Pairs_Unfiltered) <- make.unique(
+    names(Results_CombinedGels_PBUP$Pairs_Unfiltered)
+  )
+
+  dbWriteTable(db, "CombiTable_PBUP", Results_CombinedGels_PBUP$Pairs_Unfiltered, overwrite = TRUE)
+  dbWriteTable(db, "CombiTableFiltered_PBUP", Results_CombinedGels_PBUP$Pairs_Filtered, overwrite = TRUE)
+
+  ## --------------------------------------------------
+  ## 2) Prepare PacBIO unfiltered pairs
+  ## --------------------------------------------------
+  df <- Results_CombinedGels_PacBio$Pairs_Unfiltered_PacBio
+  df$V1 <- NULL
+  dful <- as.data.frame(apply(df, 2, unlist))
+  colnames(dful) <- make.unique(colnames(dful))
+
+  ## --------------------------------------------------
+  ## 3) Prepare row-wise comparison tables for export
+  ## --------------------------------------------------
+  RowWiseCompare$PeakScore <- 100
+
+  RowWiseCompare_PB <- RowWiseCompare[, .SD, .SDcols = c(
+    "gel", "type", "ENSG", "IsoFrac", "dhyper_p",
+    "Success_PB_Peptides", "All_Uniprot_Peptides", "Non_Uniprot_Peptides",
+    "IsofracOverlap", "UniprotOverlap", "PACBIO_ACC", "PB_MW",
+    "IsoFrac_MW", "Uniprot_MW", "DM_PB_min", "nClusters", "nGels",
+    "heights", "Height", "Height_lm", "Fraction_sd_80", "gel_MainPeak",
+    "score_ref_rf_PB"
+  )]
+  setnames(
+    RowWiseCompare_PB,
+    c("score_ref_rf_PB", "Success_PB_Peptides", "DM_PB_min", "PACBIO_ACC"),
+    c("score_ref", "Success_Uniprot_Peptides", "DeltaMass", "Uniprot")
+  )
+
+  RowWiseCompare_UP <- RowWiseCompare[, .SD, .SDcols = c(
+    "gel", "type", "ENSG", "IsoFrac", "dhyper_p",
+    "Success_Uniprot_Peptides", "All_Uniprot_Peptides", "Non_Uniprot_Peptides",
+    "IsofracOverlap", "UniprotOverlap", "Uniprot", "IsoFrac_MW",
+    "DM_UP", "DM_UP_min", "DeltaMass", "nClusters", "nGels",
+    "heights", "Height", "Height_lm", "Fraction_sd_80", "gel_MainPeak",
+    "score_ref_rf_UP"
+  )]
+  setnames(
+    RowWiseCompare_UP,
+    c("score_ref_rf_UP", "DM_UP_min"),
+    c("score_ref", "DeltaMass")
+  )
+
+  ## --------------------------------------------------
+  ## 4) Export filtered best-match tables
+  ## --------------------------------------------------
+  PBfun <- as.data.frame(Results_CombinedGels_PBUP$BestMatch_PB)[
+    , !duplicated(names(Results_CombinedGels_PBUP$BestMatch_PB))
+  ]
+  UPfun <- as.data.frame(Results_CombinedGels_PBUP$BestMatch_UP)[
+    , !duplicated(names(Results_CombinedGels_PBUP$BestMatch_UP))
+  ]
+
+  PBfun$score_ref <- PBfun$score_UP_gb
+  UPfun$score_ref <- UPfun$score_
+  PBfun$score_ref_PacBIO <- PBfun$score_ref
+
+  PBfun <- as.data.table(PBfun)
+  UPfun <- as.data.table(UPfun)
+
+  dbWriteTable(db, "CombinedGels_Pairs_Filtered_PACBIO", PBfun[PBfun$type == "fw"], overwrite = TRUE)
+  dbWriteTable(db, "CombinedGels_Pairs_Filtered", UPfun[UPfun$type == "fw"], overwrite = TRUE)
+
+  ## --------------------------------------------------
+  ## 5) Write per-gel tables
+  ## --------------------------------------------------
+  GN <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x) {
+    gel <- x$xname
+    dt_gn <- x$dt_gn
+    dt_gn$gel <- gel
+    dt_gn
+  })
+  GN <- rbindlist(GN)
+
+  hdbscanTables <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x) {
+    xtemp <- x$hdbscanTables
+    xtemp$Abu <- as.numeric(xtemp$Abu)
+    xtemp$Gel <- x$xname
+    xtemp
+  })
+  hdbscanTables <- rbindlist(hdbscanTables)
+
+  TMTSubset_final_singlenorm_zscore <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x) {
+    x$TMTSubset_final_singlenorm_zscore
+  })
+
+  IsoFrac_PeakResultsTable <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x) {
+    xtemp <- x$IsoFrac_PeakResultsTable
+    xtemp$gel <- x$xname
+    xtemp
+  })
+  IsoFrac_PeakResultsTable <- rbindlist(IsoFrac_PeakResultsTable)
+
+  IdentifiedPeaks_Table <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x) {
+    xtemp <- x$IdentifiedPeaks_Table
+    xtemp$gel <- x$xname
+    xtemp
+  })
+  IdentifiedPeaks_Table <- rbindlist(IdentifiedPeaks_Table)
+
+  IsoFrac_PeakResultsTable <- as.data.table(apply(IsoFrac_PeakResultsTable, 2, unlist), integer64 = "double")
+  IdentifiedPeaks_Table <- as.data.table(apply(IdentifiedPeaks_Table, 2, unlist), integer64 = "double")
+
+  gelnames <- sapply(TableListNormEnsHdbScanMW_Peaks, function(x) x$xname)
+
+  dbWriteTable(db, "GN", GN, overwrite = TRUE)
+  dbWriteTable(db, "Gels", data.frame(gels = gelnames), GN, overwrite = TRUE)
+
+  dbWriteTable(db, "hdbscanTables", hdbscanTables, overwrite = TRUE)
+  dbWriteTable(db, "IsoFrac_PeakResultsTable", IsoFrac_PeakResultsTable, overwrite = TRUE)
+  dbWriteTable(db, "IdentifiedPeaks_Table", IdentifiedPeaks_Table, overwrite = TRUE)
+
+  for (x in TableListNormEnsHdbScanMW_Peaks) {
+    dbWriteTable(db, paste("TMTSubset_final_singlenorm_zscore", x$xname, sep = "_#_"),
+                 x$TMTSubset_final_singlenorm_zscore, overwrite = TRUE)
+    dbWriteTable(db, paste("Protein_MW", x$xname, sep = "_#_"),
+                 x$Protein_MW, overwrite = TRUE)
+    dbWriteTable(db, paste("Fractions_MW", x$xname, sep = "_#_"),
+                 data.frame(x$Fractions_predicted_MW), overwrite = TRUE)
+    dbWriteTable(db, paste("hdbscanTables", x$xname, sep = "_#_"),
+                 data.frame(x$hdbscanTables), overwrite = TRUE)
+  }
+
+  dbListTables(db)
+
+  ## --------------------------------------------------
+  ## 6) Write combined unfiltered / compressed / filtered tables
+  ## --------------------------------------------------
+  df <- Results_CombinedGels$Pairs_Unfiltered
+  dful <- as.data.frame(apply(df, 2, unlist))
+  colnames(dful) <- make.unique(colnames(dful))
+
+  Results_CombinedGels_PBUP$Pairs_Unfiltered$score_ref <- Results_CombinedGels_PBUP$Pairs_Unfiltered$score_ref_rf
+
+  df <- Results_CombinedGels_PBUP$Pairs_Unfiltered
+  names(df) <- make.unique(names(df))
+
+  dbWriteTable(db, "CombinedGels_Pairs_Unfiltered", df, overwrite = TRUE)
+  dbWriteTable(
+    db,
+    "CombinedGels_Compressed_Pairs",
+    as.data.table(apply(Results_CombinedGels$Compressed_Pairs, 2, unlist), integer64 = "double"),
+    overwrite = TRUE
+  )
+
+  colnames(Results_CombinedGels$Pairs_Filtered) <- make.unique(colnames(Results_CombinedGels$Pairs_Filtered))
+  dbWriteTable(db, "CombinedGels_Pairs_Filtered", Results_CombinedGels$Pairs_Filtered, overwrite = TRUE)
+
+  ## --------------------------------------------------
+  ## 7) Build isoform count summary table
+  ## --------------------------------------------------
+  IsoformCount <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x) {
+    IP <- x$IdentifiedPeaks_Table
+    IP$Height[lengths(IP$Height) == 0] <- 0
+
+    IP <- IP[FDR_RF < 0.01, ]
+    IP <- IP[unlist(Height) >= 0, ]
+    IP <- IP[unlist(Fraction_width) < 2, ]
+
+    IP <- IP[grep(";", ENS, invert = TRUE), {
+      list(
+        MWlog10 = unique(MW_lm_Compressed_),
+        mpw = min(unlist(Height)),
+        maxFracWidth = max(unlist(Fraction_width), na.rm = TRUE),
+        MW_lm_lo = median(MW_lm_lo),
+        MW_lm_hi = median(MW_lm_lo)
+      )
+    }, ENS]
+
+    IP$Experiment <- x$xname
+    IP
+  })
+
+  IsoformCountTable <- rbindlist(IsoformCount)
+  table(IsoformCountTable$Experiment)
+
+  IsoformCountTable$Experiment <- gsub("/peptides.txt", "", IsoformCountTable$Experiment)
+  IsoformCountTable$Experiment <- gsub("/peptides_TryChymCOMBINED.txt", "_ChyTry", IsoformCountTable$Experiment)
+  IsoformCountTable$Experiment <- gsub("2020_12_23_TMTpro_", "gel1_", IsoformCountTable$Experiment)
+  IsoformCountTable$Experiment <- gsub("2021_10_09_TM.*.pro_", "gel2_", IsoformCountTable$Experiment)
+
+  dbWriteTable(db, "IsoformCountTable", IsoformCountTable, overwrite = TRUE)
+
+  ## --------------------------------------------------
+  ## 8) Finalize
+  ## --------------------------------------------------
+  dbDisconnect(db)
+  system("open ./")
+
+  file.copy(
+    "../Results_CombinedGels.rda",
+    paste(dirname(dbpath), "Results_CombinedGels.rda", sep = "/"),
+    overwrite = TRUE
+  )
+  setwd("../")
+}
+
+```
+
+
+## Transcript and ORF Category Counts from PacBio and GENCODE
+
+This section summarizes how many coding transcripts and ORFs fall into each combined category. It collapses overlapping labels into a few main groups, computes absolute and relative counts, and visualizes the distribution with pie and bar plots for the PacBio versus GENCODE comparison.
+
+
+```{r}
+library(data.table)
+library(Peptides)
+
+fa1 <- fread(
+  "../../20220114_Isofrac_v2/IsoFrac_20230217_SimilaritiesTesting_4/Figure4_v2/Archive/protein_coding_transcript_info_uniq.txt",
+  sep = "\t",
+  header = FALSE
+)
+names(fa1) <- c("Category", "ENST", "ENSG", "Category2", "seq")
+
+fa2 <- fread(
+  "../../20220114_Isofrac_v2/IsoFrac_20230217_SimilaritiesTesting_4/Figure4_v2/Archive/protein_coding_transcript_ORFinfo_withAScategory.txt",
+  sep = "\t",
+  header = TRUE
+)
+
+## Basic size checks
+fa1[, .(n_ENSG = length(unique(ENSG)), n_seq = length(unique(seq)))]
+fa2[, .(n_ORF = length(unique(ORF_seq)))]
+
+## Collapse transcript categories per sequence
+fa1[, Category2_paste := paste(sort(unique(Category2)), collapse = ";"), by = seq]
+
+Fun <- fa1[, .(
+  Transcript = .N,
+  ORF = length(unique(seq))
+), by = Category2_paste]
+
+Fun[, `:=`(
+  V1_rel = Transcript / sum(Transcript),
+  V2_rel = ORF / sum(ORF)
+)]
+
+## Simplify combined labels
+for (i in rev(c("PB_&_GENCODE", "GENCODE_from_PBcorrected", "PB_only", "GENCODE_only"))) {
+  Fun$Category2_paste[grep(i, Fun$Category2_paste)] <- i
+  fa1$Category2_paste[grep(i, fa1$Category2_paste)] <- i
+}
+
+table(Fun$Category2_paste)
+
+## Summarize by major group
+FunFun <- Fun[, .(
+  Transcript = sum(Transcript),
+  ORF = sum(ORF)
+), by = Category2_paste]
+
+FunFunMelt <- melt(FunFun, id.vars = "Category2_paste")
+FunFunMelt[, value_rel := value / sum(value), by = variable]
+FunFunMelt[, TotalSum := sum(value), by = variable]
+FunFunMelt[, GroupLabel := paste(variable, paste("(n=", TotalSum, ")", sep = ""))]
+
+FunFunMelt$GroupLabel <- factor(
+  FunFunMelt$GroupLabel,
+  c(
+    grep("ORF", unique(FunFunMelt$GroupLabel), value = TRUE, invert = TRUE),
+    grep("ORF", unique(FunFunMelt$GroupLabel), value = TRUE)
+  )
+)
+FunFunMelt$Category2_paste <- gsub("_", "\n", FunFunMelt$Category2_paste)
+
+Results_CombinedGels_PacBio$BP_Counts <- ggplot(
+  FunFunMelt,
+  aes(
+    Category2_paste,
+    y = value,
+    fill = Category2_paste,
+    label = paste(round(value_rel * 100), "%")
+  )
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap("GroupLabel", ncol = 1) +
+  xlab("") +
+  ylab("Count") +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5),
+    legend.position = "none"
+  ) +
+  guides(fill = guide_legend(nrow = 2))
+
+```
+
+
+# Preparation Figure 4
+
+### PacBio Isoform Selection and Evidence Filtering Across Expression and Size Constraints
+
+This section prepares datasets for identifying PacBio-supported isoforms and evaluating their proteomic evidence. A custom selection procedure assigns each IsoFrac peak to the best matching database entry (based on scoring), while optionally enforcing unique sequence usage to avoid redundant assignments.
+
+Multiple PacBio subsets are generated using different filtering strategies:
+	•	All sequences
+	•	Size-restricted sequences (merged isoforms)
+	•	TPM-filtered subsets (expression thresholds)
+	•	Combined size + TPM filters
+
+These variations allow systematic comparison of how sequence redundancy and transcript abundance influence the number of confidently identified isoforms.
+
+
+```{r}
+
+# PACBIO exclusive peaks with only 1+ entries
+message("PACBIO DB:")
+
+scorediffs <- c(0.8, 0.5, -1, -1)
+
+library(data.table)
+
+# Assign each IsoFrac peak to the best matching database entry.
+# Optionally remove already-used sequences while selecting the best hit per IsoFrac ID.
+DB_IF_hits <- function(DB,
+                       ALLPAIRS,
+                       rdaname = "Pacbio_Identified.rda",
+                       RemoveSequences = FALSE,
+                       Rerun = FALSE) {
+  if (!file.exists(rdaname) || Rerun) {
+    PacBIOMatched <- DB[, {
+      cat("\r", .GRP)
+
+      temp <- .SD
+      id_fun <- paste(temp$ProteinID, paste(temp$MW, "Da"), sep = " # ")
+
+      funni <- ALLPAIRS[!is.na(match(Uniprot, id_fun)), ]
+      if (nrow(funni) == 0) {
+        funni <- ALLPAIRS[1, ]
+      }
+
+      funni$TPM <- sum(temp$Abundance_TPM)
+      funni
+    }, by = .(SEQUENCE)]
+
+    # Sort by the best UniProt score first
+    PacBIOMatched <- PacBIOMatched[order(score_UP_gb, decreasing = TRUE)]
+
+    # Keep only the best entry per IsoFrac ID
+    OutFun <- data.table()
+    PacBIOMatched$IsoFracID <- paste(PacBIOMatched$ENSG, PacBIOMatched$IsoFrac_MW)
+
+    IsoFracID <- unique(PacBIOMatched$IsoFracID)
+    PacBIOMatchedTemp <- copy(PacBIOMatched)
+
+    while (length(IsoFracID) > 0) {
+      length_before <- length(IsoFracID)
+
+      temp <- PacBIOMatchedTemp[1, ]
+      PacBIOMatchedTemp <- PacBIOMatchedTemp[IsoFracID != temp$IsoFracID, ]
+
+      if (RemoveSequences) {
+        PacBIOMatchedTemp <- PacBIOMatchedTemp[SEQUENCE != temp$SEQUENCE, ]
+      }
+
+      IsoFracID <- IsoFracID[IsoFracID != temp$IsoFracID]
+      IsoFracID <- IsoFracID[!is.na(IsoFracID)]
+
+      OutFun <- rbind(OutFun, temp)
+
+      cat("\r", paste("before", length_before, "after", length(IsoFracID)))
+    }
+
+    save(OutFun, RemoveSequences, PacBIOMatched, file = rdaname)
+  }
+
+  rdaname
+}
+
+# Build several PacBIO subsets to compare size and TPM restrictions
+P1 <- PacBIO
+DB_IF_hits(
+  P1,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_ALL.rda",
+  RemoveSequences = TRUE
+)
+load("Pacbio_Identified_ALL.rda")
+
+P2 <- PacBIO[SEQUENCE == SequenceMerged]
+DB_IF_hits(
+  P2,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_SizeCondensed.rda",
+  RemoveSequences = TRUE
+)
+
+P3 <- PacBIO[SEQUENCE == SequenceMerged & Abundance_TPM > 0]
+DB_IF_hits(
+  P3,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_SizeCondensed_TPM.rda",
+  RemoveSequences = TRUE
+)
+
+P4 <- PacBIO[SEQUENCE == SequenceMerged & Abundance_TPM > 5]
+DB_IF_hits(
+  P4,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_SizeCondensed_TPM5.rda",
+  RemoveSequences = TRUE
+)
+
+# Size + TPM thresholds
+P4.1 <- PacBIO[SEQUENCE == SequenceMerged & Abundance_TPM > 1]
+DB_IF_hits(
+  P4.1,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_SizeCondensed_TPM1.rda",
+  RemoveSequences = TRUE
+)
+
+P4.2 <- PacBIO[SEQUENCE == SequenceMerged & Abundance_TPM > 2]
+DB_IF_hits(
+  P4.2,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_SizeCondensed_TPM2.rda",
+  RemoveSequences = TRUE
+)
+
+P4.3 <- PacBIO[SEQUENCE == SequenceMerged & Abundance_TPM > 3]
+DB_IF_hits(
+  P4.3,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_SizeCondensed_TPM3.rda",
+  RemoveSequences = TRUE
+)
+
+# TPM-only thresholds
+P4.1.0 <- PacBIO[Abundance_TPM > 1]
+DB_IF_hits(
+  P4.1.0,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_TPM1.rda",
+  RemoveSequences = TRUE
+)
+
+P4.2.0 <- PacBIO[Abundance_TPM > 2]
+DB_IF_hits(
+  P4.2.0,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_TPM2.rda",
+  RemoveSequences = TRUE
+)
+
+P4.3.0 <- PacBIO[Abundance_TPM > 3]
+DB_IF_hits(
+  P4.3.0,
+  Results_CombinedGels_PBUP$Pairs_Unfiltered[type == "fw"],
+  rdaname = "Pacbio_Identified_TPM3.rda",
+  RemoveSequences = TRUE
+)
+
+
+```
+
+### Plotting of evaluation of PacBio-Specific Isoform Evidence and Expression-Dependent Detection
+
+This section visualizes the proteomic evidence for PacBio-specific isoforms across multiple filtering strategies. Isoforms are classified into evidence tiers (very good, good, low, or not detected) based on machine learning–derived scores, and compared across subsets defined by sequence redundancy and transcript abundance (TPM thresholds).
+
+Barplots summarize the number of isoforms with varying levels of proteomic support under different conditions, while density and boxplots illustrate how expression (TPM) relates to identification confidence. Additional analyses quantify the fraction of isoforms supported by proteomics and assess how filtering strategies impact detection rates.
+
+```{r}
+# PACBIO exclusive peaks: evidence summary and plotting
+# -----------------------------------------------------
+
+scorediffs <- c(0.8, 0.5, -1, -1)
+
+PB_IsoFrac_Evidences <- function(rdaname, SelectENSGs = NULL) {
+  load(rdaname)
+
+  if (length(SelectENSGs) > 0 && is.character(SelectENSGs)) {
+    OutFun <- OutFun[!is.na(match(ENSG, SelectENSGs))]
+    PacBIOMatched <- PacBIOMatched[!is.na(match(ENSG, SelectENSGs))]
+  }
+
+  MappedTable <- OutFun
+  MappedTable$id <- seq_len(nrow(MappedTable))
+  MappedTable$score_UP_gb[is.na(MappedTable$score_UP_gb)] <- -1
+  MappedTable$score_UP_gb <- as.numeric(MappedTable$score_UP_gb)
+
+  IDs <- list(
+    High_Evidence = MappedTable[score_UP_gb > scorediffs[1]]$SEQUENCE,
+    Good_Evidence = MappedTable[score_UP_gb <= scorediffs[1] & score_UP_gb > scorediffs[2]]$SEQUENCE,
+    Low_Evidence  = MappedTable[score_UP_gb <= scorediffs[2] & score_UP_gb > scorediffs[3]]$SEQUENCE,
+    No_Evidence   = setdiff(unique(PacBIOMatched$SEQUENCE), unique(MappedTable$SEQUENCE))
+  )
+
+  IDs <- lapply(IDs, unique)
+  names(IDs) <- paste(
+    names(IDs),
+    c(
+      paste(">", scorediffs[1], collapse = " "),
+      paste(scorediffs[c(1, 2)], collapse = " to "),
+      paste(scorediffs[c(2, 3)], collapse = " to "),
+      ""
+    )
+  )
+
+  PB_identified <- data.table(
+    V1 = lengths(IDs),
+    V2 = names(lengths(IDs))
+  )
+  PB_identified$V2 <- factor(PB_identified$V2, levels = names(IDs))
+
+  gg <- ggplot(PB_identified, aes(V2, V1, fill = V2, label = V1)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(vjust = -1) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    ylab("PACBIO IsoForm proteomic Evidences")
+
+  list(gg = gg, table = PB_identified)
+}
+
+# Keep only genes with more than one PacBio sequence
+Selection <- PacBIO[, .(V1 = uniqueN(SEQUENCE)), by = ENSG]
+ENSGSelection <- Selection[V1 > 1]$ENSG
+
+# ---------------------------------------------------------------------
+# Build summaries for the saved PacBio subset files
+# ---------------------------------------------------------------------
+
+files <- c(
+  "./Pacbio_Identified_ALL.rda",
+  "./Pacbio_Identified_SizeCondensed.rda",
+  "./Pacbio_Identified_SizeCondensed_TPM1.rda",
+  "./Pacbio_Identified_SizeCondensed_TPM2.rda",
+  "./Pacbio_Identified_SizeCondensed_TPM3.rda",
+  "./Pacbio_Identified_TPM1.rda",
+  "./Pacbio_Identified_TPM2.rda",
+  "./Pacbio_Identified_TPM3.rda"
+)
+
+DB_IF_hits_figure <- lapply(files, PB_IsoFrac_Evidences, SelectENSGs = ENSGSelection)
+names(DB_IF_hits_figure) <- c(
+  "All", "Size Restricted", "Size & TPM > 1", "Size & TPM > 2",
+  "Size & TPM > 3", "TPM > 1", "TPM > 2", "TPM > 3"
+)
+
+DB_IF_hits_list <- lapply(seq_along(DB_IF_hits_figure), function(it) {
+  x <- DB_IF_hits_figure[[it]]
+  xt <- x$table
+  xt$type <- names(DB_IF_hits_figure)[it]
+  xt
+})
+
+DB_IF_hits_dt <- rbindlist(DB_IF_hits_list)
+
+PB_Matched <- lapply(seq_along(files), function(it) {
+  load(files[it])
+  PacBIOMatched$SubsetType <- names(DB_IF_hits_figure)[it]
+  PacBIOMatched
+})
+
+PB_Matcheddt <- rbindlist(PB_Matched)
+
+PB_Matcheddt$ScoreType <- "Not Mapped"
+PB_Matcheddt$ScoreType[PB_Matcheddt$score_UP_gb >= scorediffs[1]] <- "Very Good"
+PB_Matcheddt$ScoreType[PB_Matcheddt$score_UP_gb < scorediffs[1] & PB_Matcheddt$score_UP_dl > scorediffs[2]] <- "Good"
+PB_Matcheddt$ScoreType[PB_Matcheddt$score_UP_gb < scorediffs[2]] <- "Low"
+PB_Matcheddt$ScoreType <- factor(PB_Matcheddt$ScoreType, levels = c("Very Good", "Good", "Low", "Not Mapped"))
+PB_Matcheddt$SubsetType <- factor(PB_Matcheddt$SubsetType, levels = names(DB_IF_hits_figure))
+names(PB_Matcheddt) <- make.unique(names(PB_Matcheddt))
+
+# Group labels for the barplots
+DB_IF_hits_dt$Group <- "All Abundances"
+DB_IF_hits_dt$Group[grep("Size &", DB_IF_hits_dt$type)] <- "Size & TPM"
+DB_IF_hits_dt$Group[grep("^TPM", DB_IF_hits_dt$type)] <- "TPM"
+
+# ---------------------------------------------------------------------
+# Figure panels
+# ---------------------------------------------------------------------
+
+ra <- c(0, max(DB_IF_hits_dt$V1))
+
+PB_ExclusiveBestPeak <- ggplot(
+  DB_IF_hits_dt[Group == "All Abundances"],
+  aes(V2, V1, fill = type, label = V1, group = type)
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(position = position_dodge(width = 1), size = 3, vjust = 0.5, hjust = 1, angle = 90, color = "black") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylab("PACBIO IsoForms") +
+  ylim(ra) +
+  xlab("") +
+  ggtitle("")
+
+PB_ExclusiveBestSizeTPM <- ggplot(
+  DB_IF_hits_dt[Group == "Size & TPM"],
+  aes(V2, V1, fill = type, label = V1, group = type)
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(position = position_dodge(width = 1), size = 3, vjust = 0.5, hjust = 1, angle = 90, color = "black") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylab("PACBIO IsoForms") +
+  ylim(ra) +
+  xlab("") +
+  ggtitle("with TPM CutOff &\nSize Restriction")
+
+PB_ExclusiveBestSize <- ggplot(
+  DB_IF_hits_dt[Group == "TPM"],
+  aes(V2, V1, fill = type, label = V1, group = type)
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(position = position_dodge(width = 1), size = 3, vjust = 0.5, hjust = 1, angle = 90, color = "black") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylab("PACBIO IsoForms") +
+  ylim(ra) +
+  xlab("") +
+  ggtitle("with TPM CutOff")
+
+# PacBio abundance distribution with cutoff lines
+Dgg <- ggplot(PacBIO, aes(log10(Abundance_TPM))) +
+  geom_density(fill = "skyblue") +
+  geom_vline(xintercept = log10(c(1, 2, 3)), color = "orange", lty = "solid", lwd = 1) +
+  coord_cartesian(xlim = c(-1, 4)) +
+  annotate("text", x = log10(1:3), y = 0, label = paste("Cutoff:", 1:3), hjust = 0, vjust = 1, angle = 90) +
+  ylab("Density")
+
+pdf("PB_Exclusive_Peaks_MultiIsoforms.pdf", width = 12, height = 12)
+
+# ---------------------------------------------------------------------
+# Fractions and abundance summaries
+# ---------------------------------------------------------------------
+
+DB_IF_hits_dt[, V1_rel := V1 / sum(V1), by = .(Group, type)]
+
+DB_FUN <- DB_IF_hits_dt[V2 != "No_Evidence", .(
+  V1 = sum(V1[V2 != "No_Evidence"]),
+  V1_rel = sum(V1_rel[V2 != "No_Evidence"])
+), by = .(type, Group)]
+
+FractionCheck <- ggplot(DB_FUN, aes(V1, V1_rel, label = type, pch = Group)) +
+  geom_point(size = 3) +
+  geom_text_repel() +
+  xlab("Identified Isoforms") +
+  ylab("Identified Fraction")
+
+AbundanceBP <- ggplot(PB_Matcheddt, aes(log10(TPM), ScoreType, color = ScoreType)) +
+  geom_boxplot() +
+  facet_wrap("SubsetType", ncol = 1) +
+  coord_cartesian(xlim = c(0, 2))
+
+p1 <- plot_grid(
+  PB_ExclusiveBestPeak + theme(legend.position = "bottom") +
+    guides(fill = guide_legend(nrow = 3, byrow = TRUE, size = 0.5, title = element_blank())),
+  PB_ExclusiveBestSize + theme(legend.position = "bottom") +
+    guides(fill = guide_legend(nrow = 3, byrow = TRUE, size = 0.5, title = element_blank())),
+  PB_ExclusiveBestSizeTPM + theme(legend.position = "bottom") +
+    guides(fill = guide_legend(nrow = 3, byrow = TRUE, size = 0.5, title = element_blank())),
+  nrow = 1,
+  align = "hv"
+)
+
+p2 <- FractionCheck +
+  ggtitle("Identified Fraction\n") +
+  theme(legend.position = "right") +
+  guides(pch = guide_legend(nrow = 3, byrow = TRUE, size = 1, title = element_blank()))
+
+plot_grid(
+  plot_grid(Dgg, AbundanceBP, ncol = 1, rel_heights = c(1, 2), labels = c("A", "B")),
+  plot_grid(p1, p2, ncol = 1, rel_heights = c(1, 0.8), labels = c("C", "D")),
+  ncol = 2,
+  rel_widths = c(0.7, 1)
+)
+
+dev.off()
+system("open PB_Exclusive_Peaks_MultiIsoforms.pdf")
+
+# ---------------------------------------------------------------------
+# Overview counts and pie plot
+# ---------------------------------------------------------------------
+
+Overview_Counts_PB_UP <- DB_IF_hits_dt[!is.na(match(type, c("All", "TPM > 3", "Size & TPM > 3", "Size Restricted"))),
+  sum(V1),
+  by = .(Group, type, V2 != "No_Evidence")
+]
+
+Overview_Counts_PB_UP$V2 <- factor(
+  Overview_Counts_PB_UP$V2,
+  c("TRUE", "FALSE"),
+  c("RNA & Protein", "RNA")
+)
+setnames(Overview_Counts_PB_UP, "V2", "Evidence")
+
+Overview_Counts_PB_UP[, V1_Rel := V1 / sum(V1), by = .(Group, type)]
+Overview_Counts_PB_UP$type <- factor(Overview_Counts_PB_UP$type, c("All", "Size Restricted", "TPM > 3", "Size & TPM > 3"))
+Overview_Counts_PB_UP[, TotalCount := sum(V1), by = type]
+Overview_Counts_PB_UP$type2 <- paste(Overview_Counts_PB_UP$type, paste("\nn =", Overview_Counts_PB_UP$TotalCount), sep = "\n")
+
+Overview_Counts_PB_UP_FactorTable <- Overview_Counts_PB_UP[, .(type, type2)][order(type)]
+Overview_Counts_PB_UP$type2 <- factor(Overview_Counts_PB_UP$type2, levels = Overview_Counts_PB_UP_FactorTable$type2)
+
+g <- ggplot(Overview_Counts_PB_UP, aes(x = 1, y = V1_Rel * 100, fill = Evidence, label = V1)) +
+  facet_wrap("type2", nrow = 1)
+
+set.seed(12)
+ggpie <- g +
+  geom_col() +
+  geom_text(size = 3, check_overlap = FALSE) +
+  coord_polar("y", clip = "off") +
+  xlab("") +
+  ylab("") +
+  geom_text(aes(label = paste(round(V1_Rel * 100, 1), "%")), size = 5, position = position_stack(vjust = 0.5)) +
+  theme(
+    legend.position = "bottom",
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+Results_CombinedGels_PBUP$RNAIdentifiedFraction$Pie <- ggpie
+
+```
+
+# Figure 4 
+
+```{r}
+
+library(pdftools)
+library(data.table)
+
+# -------------------------------------------------------------------
+# Build example trace plots for selected genes, if not already loaded
+# -------------------------------------------------------------------
+if (!exists("TMPO_Traces")) {
+  input <- list(GN = "ENSG00000120802", inputtable = "Exp1_10per_Try")
+  dbPath <- "./IsoFrac_0.86/TableListNormEnsHdbScanMW_Peaks.sqlite"
+
+  dataset <- Extract_IsoFrac_Info(ROC = dbPath, input = input)
+  dataset$hdbscanTables <- dataset$hdbscanTables[BestCluster != 0]
+
+  # Keep peak heights in a readable range for plotting
+  LM <- as.numeric(dataset$Pairs_Filtered_Compressed$Height)
+  LM[LM < 0.35] <- 3.5
+  dataset$Pairs_Filtered_Compressed$Height <- LM
+
+  TMPO_Traces <- Traces_Plotly(
+    dataset,
+    ShowQuantiles = TRUE,
+    linelwd = 0.5,
+    StarSize = 2.5,
+    mpwcutoff = 0.1
+  )
+  TMPO_Traces$g <- TMPO_Traces$g +
+    ylim(c(-1, 5)) +
+    theme(legend.title = element_blank()) +
+    theme(legend.position = "none")
+
+  dbPath <- "IsoFrac_0.86//TableListNormEnsHdbScanMW_Peaks.sqlite"
+  input <- list(GN = "ENSG00000007866", inputtable = "Exp1_10per_Try")
+  dataset <- Extract_IsoFrac_Info(dbPath, input)
+  Tead3_Traces <- Traces_Plotly(dataset, linelwd = 0.75, StarSize = 2.5)
+}
+
+# -------------------------------------------------------------------
+# ROC plot and RNA fraction pie chart
+# -------------------------------------------------------------------
+AUC <- Results_CombinedGels_PBUP$ROC +
+  theme(legend.position = "right") +
+  guides(fill = guide_legend(ncol = 1, byrow = TRUE, label.hjust = -0.2)) +
+  xlab("Specificity") +
+  ggtitle("PACBIO Best Matching Entry")
+
+f4_p3 <- plot_grid(
+  AUC,
+  Results_CombinedGels_PBUP$RNAIdentifiedFraction$Pie,
+  rel_widths = c(0.75, 1),
+  labels = c("D", "E")
+)
+
+# PacBio example panel for TMPO
+xpath <- pdf_convert("./WB_Confirmation/TMPO_PACBIO_example.pdf", dpi = 300)
+TMPO_Pacbio <- ggdraw() + draw_image(xpath)
+
+f4_p2 <- plot_grid(
+  TMPO_Pacbio + ggtitle("PACBIO Results for TMPO"),
+  plot_grid(
+    TMPO_Traces$g + ggtitle("ISOFRAC Traces for TMPO") + ylim(c(-1, 6)),
+    AUC,
+    nrow = 1,
+    labels = c("", "E"),
+    rel_widths = c(1, 0.85)
+  ),
+  Results_CombinedGels_PBUP$RNAIdentifiedFraction$Pie,
+  labels = c("C", "D", "F"),
+  nrow = 3,
+  scale = c(0.9, 0.9, 1),
+  rel_widths = c(1, 0.75)
+)
+
+# -------------------------------------------------------------------
+# Placeholder counts for manuscript panel A/B
+# -------------------------------------------------------------------
+f <- fread("comprehensiveORF_PacBio_GENCODE_v2.txt", sep = "\t")
+
+ORFCounts <- f[, .(dim(.SD)[1], length(unique(ORF_seq))), GENCODE_gene_ID]
+ORFcounts <- ORFCounts[, .(
+  "unique ORFs" = length(GENCODE_gene_ID),
+  "unique Transcripts" = sum(V1)
+), V2]
+
+ORFcounts2 <- ORFcounts[V2 >= 8, .(
+  V2 = "8+",
+  "unique ORFs" = sum(as.data.frame(.SD)[, 2]),
+  "unique Transcripts" = sum(as.data.frame(.SD)[, 3])
+)]
+
+ORFcounts3 <- rbind(ORFcounts[V2 < 8], ORFcounts2)
+ORFcountsAll <- melt(ORFcounts3, id.vars = "V2")
+
+RNAcounts <- ggplot(
+  ORFcountsAll,
+  aes(V2, value, fill = variable, label = value)
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("Variants per Gene") +
+  ylab("Count") +
+  theme(legend.title = element_blank()) +
+  geom_text(
+    angle = 90,
+    position = position_dodge(width = 0.9),
+    vjust = 0.5,
+    hjust = -0.2
+  ) +
+  theme(legend.title = element_blank())
+
+A4 <- fread("Figure4B_data.csv", sep = ",")
+A4Melt <- melt(A4)
+
+# Replace the generic ORF count plot with the manuscript count plot
+RNAcounts <- ggplot(
+  A4Melt,
+  aes(variable, value, fill = Count_trans_ORFs_per_gene, label = value)
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("Variants per Gene") +
+  ylab("Count") +
+  theme(legend.title = element_blank()) +
+  geom_text(
+    angle = 90,
+    position = position_dodge(width = 0.9),
+    vjust = 0.5,
+    hjust = -0.2
+  ) +
+  theme(legend.title = element_blank()) +
+  ylim(c(0, 4300))
+
+# Manuscript sketch placeholder
+xpath <- pdf_convert("./Figure4_v2/Mengran_Sketch_mod.pdf", dpi = 300)
+Mengran1 <- ggdraw() + draw_image(xpath)
+
+# -------------------------------------------------------------------
+# Assemble Figure 4
+# -------------------------------------------------------------------
+f4_p1 <- plot_grid(
+  Mengran1,
+  Results_CombinedGels_PacBio$BP_Counts +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 90, vjust = 0.5)),
+  RNAcounts + theme(legend.position = "bottom"),
+  rel_widths = c(0.9, 0.7, 0.9),
+  ncol = 3,
+  labels = c("A", "B", ""),
+  scale = c(0.8, 1, 1)
+)
+
+f4 <- plot_grid(
+  f4_p1,
+  f4_p2,
+  ncol = 1,
+  rel_heights = c(0.4, 1),
+  labels = c("", "", "G")
+)
+
+pdf("Figure_4_v2.pdf", height = 12, width = 10)
+plot(f4)
+dev.off()
+ggsave("Figure_4_v2.jpeg", f4, width = 10, height = 12)
+```
+
+
+# Figure 5 Manuscript Rebuttal 20260312
+
+## collecting subfigures
+```{r}
+ProteinCategory_BP <- Results_CombinedGels_PBUP$IsoformFractions
+f4_p3 <- Results_CombinedGels_PBUP$RNAIdentifiedFraction$Pie
+Category_BP <- Results_CombinedGels_PBUP$FractionOfIdentifed+ylab("# Isoforms")+xlab("Best Scoring DB")
+Category_BP_rel <- Results_CombinedGels_PBUP$FractionOfIdentifed_rel+ylab("Isoform Fraction")+xlab("Best Scoring DB")
+ra <- c(-10^5,10^5)*c(5,2)
+DeltaMassFig <- Results_CombinedGels_PBUP$DM_plots$DM+
+  theme(legend.position = "right",legend.title = element_blank())+
+  coord_cartesian(xlim=ra,ylim=ra)+
+  guides(color=guide_legend(byrow=TRUE))
+DeltaMassFigCounts <- Results_CombinedGels_PBUP$DM_plots$counts
+load("LOPIT_VALIDATION.rda")
+```
+## Plotting
+```{r}
+library(grid)
+library(msa)
+library(ggmap)
+library(ggh4x)
+library(cowplot)
+library(pdftools)
+
+# -------------------------------------------------------------------
+# Helper: remove selected layers from an existing ggplot object
+# -------------------------------------------------------------------
+gg_layerremove <- function(gg, removeTag = "PeakPosition|alpha") {
+  gg$layers <- lapply(gg$layers, function(x) {
+    if (any(grepl(removeTag, names(x$data)))) {
+      return(NULL)
+    }
+    x
+  })
+  gg$layers <- gg$layers[lengths(gg$layers) > 0]
+  gg
+}
+
+# -------------------------------------------------------------------
+# Load western blot collections once
+# -------------------------------------------------------------------
+if (!exists("CollectGG_v2")) {
+  load("E:/MaxQuant/HZ/20220114_Isofrac_v2/IsoFrac_20230217_SimilaritiesTesting_4/WB_Confirmation/WB_Supplemental/CollectionWB_Supplemental.rda")
+  
+  Collection_2_WB_N_backup <- Collection_2_WB_N
+  
+  Collection_2_WB_N$gg <- gg_layerremove(Collection_2_WB_N$gg)
+  Collection_2_WB_C$gg <- gg_layerremove(Collection_2_WB_C$gg)
+  CollectionWB_C$gg    <- gg_layerremove(Collection_2_WB_C$gg)
+}
+
+# -------------------------------------------------------------------
+# Base panels and shared styling
+# -------------------------------------------------------------------
+Tead3_WB <- ggdraw() +
+  draw_image("E:/MaxQuant/HZ/20220114_Isofrac_v2/IsoFrac_20260302_SimilaritiesTesting_5_Backup/WB_Confirmation/TEAD3_RPE1.jpg")
+WB_BirA_cterm <- ggdraw() +
+  draw_image("E:/MaxQuant/HZ/20220114_Isofrac_v2/IsoFrac_20260302_SimilaritiesTesting_5_Backup//WB_Confirmation/BirA_Tag_Design_Cterm_v2.png")
+WB_BirA_nterm <- ggdraw() +
+  draw_image("E:/MaxQuant/HZ/20220114_Isofrac_v2/IsoFrac_20260302_SimilaritiesTesting_5_Backup/WB_Confirmation/BirA_Tag_Design_nterm_v2.png")
+
+Style <- theme(
+  plot.title = element_text(hjust = 0.75),
+  legend.position = "none",
+  axis.text.x = element_blank()
+)
+
+Tead3_nterminal <- Collection_2_WB_N$gg +
+  coord_cartesian(xlim = c(0.09, 0.22), ylim = c(0.1, 0.9)) +
+  ggtitle("Tead3\nnterm") +
+  Style +
+  scale_alpha(range = c(1, 1))
+
+Tead3_cterminal <- CollectionWB_C$gg +
+  coord_cartesian(xlim = c(0.015, 0.18), ylim = c(0.1, 0.9)) +
+  ggtitle("Tead3\ncterm") +
+  Style
+
+# Optional sanity check
+Collection_2_WB_N$GelPeaks$TEAD3$Ladder
+
+NELFA_WB <- plot_grid(
+  Collection_2_WB_N$gg +
+    coord_cartesian(xlim = c(0.35, 0.51), ylim = c(0.1, 0.9)) +
+    ggtitle("NELFA\nnterm") +
+    Style +
+    scale_alpha(range = c(1, 1)),
+  Collection_2_WB_C$gg +
+    coord_cartesian(xlim = c(0.35, 0.51), ylim = c(0.1, 0.9)) +
+    ggtitle("NELFA\ncterm") +
+    Style +
+    scale_alpha(range = c(1, 1)),
+  labels = ""
+)
+
+CTTNBP2NL_WB <- plot_grid(
+  Collection_2_WB_N$gg +
+    coord_cartesian(xlim = c(0.5, 0.66), ylim = c(0.1, 0.9)) +
+    ggtitle("CTTNBP2NL\nnterm") +
+    Style +
+    scale_alpha(range = c(1, 1)),
+  Collection_2_WB_C$gg +
+    coord_cartesian(xlim = c(0.5, 0.66), ylim = c(0.1, 0.9)) +
+    ggtitle("CTTNBP2NL\ncterm") +
+    Style +
+    scale_alpha(range = c(1, 1)),
+  labels = ""
+)
+
+RRP1B_WB <- plot_grid(
+  Collection_2_WB_N$gg +
+    coord_cartesian(xlim = c(0.66, 0.8), ylim = c(0.1, 0.9)) +
+    ggtitle("RRP1B\nnterm") +
+    Style +
+    scale_alpha(range = c(1, 1)),
+  Collection_2_WB_C$gg +
+    coord_cartesian(xlim = c(0.66, 0.8), ylim = c(0.1, 0.9)) +
+    ggtitle("RRP1B\ncterm") +
+    Style +
+    scale_alpha(range = c(1, 1)),
+  labels = ""
+)
+
+# -------------------------------------------------------------------
+# Domain / peptide mapping inputs
+# -------------------------------------------------------------------
+load("./WB_Confirmation/WB/HypatiaVersion/IsoFrac_Domain_SequenceAnalysis_woSemi.rda")
+load("./WB_Confirmation/WB/HypatiaVersion/PfamDomainMappings.rda")
+load("./WB_Confirmation/WB/HypatiaVersion/PfamDomainMappingsDomainSequence.rda")
+load("./WB_Confirmation/WB/HypatiaVersion/SemiTrypticInfo.rda")
+
+# -------------------------------------------------------------------
+# Generate peptide-to-domain maps for key genes
+# -------------------------------------------------------------------
+try(Tead3 <- IF_DB_Peptidemapping_modified(
+  x = GeneList$TEAD3,
+  IsoFrac_Domain_SequenceAnalysis = IsoFrac_Domain_SequenceAnalysis,
+  ProteinSequencesCategories = ProteinSequencesCategories,
+  invertOrder = TRUE,
+  allgels = TRUE,
+  facetPlot = FALSE
+))
+Tead3$MSAPlot3
+
+try(NELFA <- IF_DB_Peptidemapping_modified(
+  GeneList$NELFA,
+  IsoFrac_Domain_SequenceAnalysis,
+  ProteinSequencesCategories,
+  invertOrder = TRUE,
+  allgels = TRUE,
+  facetPlot = FALSE
+))
+
+try(CTTNBP2N <- IF_DB_Peptidemapping_modified(
+  GeneList$CTTNBP2N,
+  IsoFrac_Domain_SequenceAnalysis,
+  ProteinSequencesCategories,
+  invertOrder = TRUE,
+  allgels = TRUE,
+  facetPlot = FALSE
+))
+
+try(RRP1B <- IF_DB_Peptidemapping_modified(
+  GeneList$RRP1B,
+  IsoFrac_Domain_SequenceAnalysis,
+  ProteinSequencesCategories,
+  invertOrder = TRUE,
+  allgels = TRUE,
+  facetPlot = FALSE
+))
+
+# -------------------------------------------------------------------
+# UPDATE version: annotated Tead3 western blot and final figure layout
+# -------------------------------------------------------------------
+load("E:/MaxQuant/HZ/20220114_Isofrac_v2/REBUTTAL_Temp/LOPIT_Rebuttal_ForFigure.rda")
+
+p <- copy(gg_CTSB_LOPIT)
+selection <- c(1:9,14,12,22,24,30,31)
+pFinal <- copy(p)
+pFinal$layers <- pFinal$layers[selection]
+gg_CTSB_LOPIT <- pFinal
+
+ProteinCategory_BP$layers[[2]]$aes_params$size <- 2
+
+upperrow_RNA_PROTEIN_Integration <- plot_grid(
+  Category_BP +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+      legend.text = element_text(size = 2)
+    ),
+  Category_BP_rel +
+    theme(
+      legend.position = "bottom",
+      legend.text = element_text(size = 8)
+    ) +
+    guides(
+      color = guide_legend(override.aes = list(label = NA_character_)),
+      fill = guide_legend(nrow = 3, byrow = TRUE)
+    ),
+  rel_heights = c(0.75, 1),
+  ncol = 1
+)
+
+lowerrow_RNA_PROTEIN_Integration <- plot_grid(
+  DeltaMassFig +
+    ggtitle("Isoform Pairs UniProt vs PACBIO", subtitle = "Uniprot or PACBIO Score > 0.8") +
+    update_geom_defaults(geom = "point", new = list(size = 0.5)) +
+    theme(
+      legend.position = "none",
+      legend.text = element_text(size = 5),
+      title = element_text(size = 8)
+    ),
+  DeltaMassFigCounts +
+    ggtitle("Counts") +
+    xlab("") +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+    ),
+  ProteinCategory_BP +
+    theme(
+      legend.position = "bottom",
+      legend.margin = margin(l = -4, unit = "cm"),
+      title = element_text(size = 8)
+    ) +
+    ylim(c(-0.1, 1)) +
+    guides(fill = guide_legend(nrow = 2, byrow = TRUE, override.aes = aes(label = ""))),
+  rel_widths = c(1.1, 0.7, 1),
+  nrow = 1,
+  rel_heights = c(1, 0.7),
+  labels = c("B", "", "C")
+)
+
+Label1 <- "50.1 ->"
+Label2 <- "<- 25.8 (new)"
+Label3 <- "<- 20.2?"
+
+Tead3_WB_annotated <- Tead3_WB +
+  annotate("label", x = 0.3, y = 0.77, label = Label1, color = "tomato", hjust = 1, vjust = 1) +
+  annotate("label", x = 0.56, y = 0.55, label = Label2, color = "tomato", angle = -20, hjust = 0, vjust = 1) +
+  annotate("label", x = 0.92, y = 0.26, label = Label3, color = "tomato", alpha = 0.6, hjust = 0, vjust = 1)
+
+gbbp_mod <- gbbp + scale_y_discrete(labels = c(
+  "Shorter Variants" = "Shorter\nVariants"
+))+xlim(c(0,2))
+
+Tead3_combi <- plot_grid(
+  Tead3_Traces$g +
+    ggtitle("TEAD3 Peptide Traces") +
+    xlim(c(15, 60)) +
+    theme(
+      legend.title = element_blank(),
+      legend.position = "bottom"
+    ),
+  Tead3$MSAPlot3 +
+    theme(legend.position = "bottom") +
+    guides(fill = guide_legend(nrow = 2)),
+  ncol = 2,
+  scale = 0.9,
+  labels = c("", "E"),
+  rel_heights = c(0.5, 1)
+)
+
+graphics.off()
+Lopit <- plot_grid(
+  PCA_markers2_hull_v2 +
+    theme(legend.position = "bottom", legend.title = element_blank()) +
+    guides(fill = guide_legend(nrow = 4)),
+  plot_grid(
+    gg_CTSB_LOPIT,
+    gbbp_mod,
+    ncol = 1,
+    labels = c("H", "E")
+  ),
+  ncol = 2,
+  labels = c("G", ""),
+  rel_widths = c(1, 0.8)
+)
+
+WB_Subset_1 <- plot_grid(
+  WB_BirA_nterm,
+  WB_BirA_cterm,
+  Tead3_WB_annotated,
+  ncol = 1,
+  rel_heights = c(0.3, 0.3, 1),
+  labels = c("F", ""),
+  scale = c(1, 1, 0.9)
+)
+
+pdf("Figure_5_v4.pdf", height = 12, width = 10)
+
+fig5 <- plot_grid(
+  plot_grid(
+    upperrow_RNA_PROTEIN_Integration,
+    plot_grid(
+      lowerrow_RNA_PROTEIN_Integration,
+      Tead3_combi,
+      ncol = 1,
+      labels = c("", "D")
+    ),
+    ncol = 2,
+    rel_widths = c(0.25, 1),
+    labels = c("A", "B")
+  ),
+  plot_grid(
+    WB_Subset_1,
+    Lopit,
+    rel_widths = c(0.3, 1),
+    scale = 0.9
+  ),
+  ncol = 1,
+  rel_heights = c(1, 1, 1.5),
+  scale = c(1, 1, 1),
+  labels = c("", "")
+)
+
+plot(fig5)
+
+dev.off()
+ggsave("Figure_5_v4.jpeg", fig5, width = 10, height = 12)
+```

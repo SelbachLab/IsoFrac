@@ -1,0 +1,2663 @@
+---
+title: "Isofrac_PeakFinder"
+author: "Henrik Zauber"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# ISOFRAC PeakFinder Module
+## Purpose
+This module finds distinct protein isoform signals (peaks) inside clusters of peptides produced by the HDBSCAN clustering step.
+Main goals:
+	-	Detect peaks inside each peptide cluster (these peaks represent protein isoform candidates).
+	-	Estimate peak position and uncertainty (bootstrapping and linear fits through the left and right sides of the peak).
+	-	Build networks that connect identified IsoFrac peaks to known database proteins (by shared peptide sequences).
+	-	Provide quality scores and false-discovery control (Random Forest / Deep Learning and comparisons to randomized data).
+	-	Produce compact tables used by the interactive IsoFrac viewer.
+
+## Initialization  
+
+This chunk sets up the working directory, loads required R packages, and reads previously prepared datasets:
+	-	ProteinSequences: Uniprot / reference sequences used for mapping sequences to known proteins.
+	-	TableListNormEnsHdbScanMW_noSeq_noMD.rda: the main IsoFrac data structure produced by the compiler step (per-gene peptide tables, clustering results, z-scored traces, etc.).
+
+It also:
+	-	Ensures cluster labels are in the expected fields (copies cl_2 into a backup field if needed).
+	-	Loads pre-trained molecular-weight (MW) models used later to convert fraction numbers to estimated MW.
+	-	Sets parameters such as number of threads, score cutoffs, and whether we run semi-tryptic mode.
+
+This is a one-time setup required before running the PeakFinder analysis.
+
+
+```{r Initiation}
+
+dir.create("E:/MaxQuant/HZ/20220114_Isofrac_v2/Peakfinder9_newAlgorithm/")
+setwd("E:/MaxQuant/HZ/20220114_Isofrac_v2/Peakfinder9_newAlgorithm")
+ProteinSequences <- readRDS("../Protein_ENSG_Reference_HS-UP000005640-2021_gff.rds")
+SemiTryptic <- F
+if(SemiTryptic){
+  setwd("E:/MaxQuant/HZ/20230327_isofrac_semitryptic/Peakfinder")
+}
+
+library(data.table)
+library(ggplot2)
+library(igraph)
+library(parallel)
+library(igraph)
+library(pROC)
+library(h2o)
+library(ggplot2)
+getwd()
+setwd_knit <- function(x){knitr::opts_knit$set(root.dir = x )}
+path <- "../IsoFracCompiler2/Experiments/TableListNormEnsHdbScanMW_noSeq_noMD_v3.rda" # from Script 1_ISOFRAC_Compiler.Rmd, readjust the path, if necessary
+
+if(!exists("TableListNormEnsHdbScanMW_noSeq_noMD")){
+  hu <-load(path)
+  file.info(path)
+  table(TableListNormEnsHdbScanMW_noSeq_noMD[[2]]$InputTable$SearchSpecificity)
+}
+
+TableListNormEnsHdbScanMW_noSeq_noMD <- lapply(TableListNormEnsHdbScanMW_noSeq_noMD,function(x){
+  if(length(x$hdbscanTables$cl_2_backup)==0){
+    print("Preparing Cluster Names")
+    x$hdbscanTables$cl_2_backup <- x$hdbscanTables$cl_2
+    x$hdbscanTables$cl_2 <- x$hdbscanTables$BestCluster
+  
+   x$hdbscanTables_random$cl_2_backup <- x$hdbscanTables_random$cl_2
+    x$hdbscanTables_random$cl_2 <- x$hdbscanTables_random$BestCluster
+  }else{
+    print("FOUND cl_2_backup entry")
+  }
+  x
+})
+
+print(paste("loaded dataset created at",file.info(path)$mtime))
+
+
+MainWD <- getwd()
+setwd_knit(MainWD)
+threads <- 100
+rerun <- T
+
+if(!exists("Models")){
+        load("../IsoFracCompiler2_noSemitryptic/Experiments/MW_Models_v3.rda")
+
+}
+# h2o.init()
+try(h2o.shutdown(prompt = F))
+ScoreCutoff <- 0.9
+
+
+```
+
+
+
+##  Functions
+
+Below we define helper functions used by the PeakFinder pipeline. For each function the short intent is given so the reader can quickly understand what it does before reading details.
+checkClusterLengths
+
+Quick diagnostic: draws a barplot of the number of unique peptide sequences per cluster for nonzero clusters. Use to inspect clustering output quality.
+
+### Isofrac_PeakFinder(it, randomized = FALSE, ...)
+
+High-level per-gene peak finder. For a given gene (indexed by it):
+	-	Collects all peptide traces that map to that gene.
+	-	For each HDBSCAN cluster inside that gene:
+	-	Builds a robust average profile (bootstrap medians).
+	-	Smooths and locates candidate peaks using findpeaks.
+	-	For each candidate peak:
+	-	Fits simple linear models to the left and right flanks of the peak to estimate the peak apex (fraction) and height.
+	-	Bootstraps these flank fits to get confidence intervals and SD estimates for fraction and height.
+	-	Stores peak metrics and quality features for downstream FDR/prediction.
+	-	randomized = TRUE runs the same logic on a randomized cluster assignment (used to build null distributions).
+
+Outputs: a table of peaks for that gene with estimated fraction, MW (later converted), height, bootstrap uncertainty, cluster id, and additional QC features.
+
+Implementation note: we use bootstrapped flank fits rather than complex curve fitting to make the peak location estimation robust to outliers and missing fractions.
+
+### lm_checker(start, end, df, bootstrap=FALSE, ...)
+
+Fit a linear model to a segment of the averaged trace. Returns the fit object and summary plot option. When bootstrap=TRUE it resamples the data segment to estimate variability for slope/intercept.
+
+### lmIntx(fit1, fit2)
+
+Compute the intersection point of two linear fits by algebra (used to estimate the peak apex from left and right flank fits). Returns the x (fraction) and y (height) of the intersection.
+
+### ggtraces(input, ens_identifier)
+
+Build ggplot visualizations of the traces for a single gene and overlay identified peak positions and confidence intervals (used in figures and the viewer).
+
+### NetworkTablesCompiler(ensIT, iprTable)
+
+Make pairwise comparisons of identified peaks for a given gene. Computes statistical tests (Wilcoxon) comparing MW estimates between pairs and packages results for network assembly.
+
+### nw_assembler(...) and nw_plot(...)
+
+Assemble and visualize the bipartite network that connects:
+	-	Peptide sequence nodes (clusters / sequences),
+	-	IsoFrac peak nodes (compressed MW variants),
+	-	Optional database protein nodes (UniProt entries matched by sequence).
+
+### nw_assembler builds the node + edge tables; nw_plot can render them with visNetwork (interactive) or igraph (static) and compute pairwise similarity matrices for nodes.
+
+### traces_info_crawler(input, EnsID, ...)
+
+Helper to filter the IsoFrac_PeakResultsTable for a specific gene (EnsID) and return a small table of peaks that satisfy chosen score and uncertainty cutoffs (used to choose reliable peaks when assembling networks).
+
+```{r Functions}
+# ------------------------------------------------------------------------------
+# Quick diagnostic: how many peptide traces contribute to each non-noise cluster?
+# Used to inspect whether clustering produces reasonable cluster sizes per gene.
+# ------------------------------------------------------------------------------
+
+checkClusterLengths <- function(x){
+  barplot(table(x$hdbscanTables[cl_2!=0,length(unique(Seq)),.(cl_2,EnsG)]$V1))
+}
+
+# ------------------------------------------------------------------------------
+# Main PeakFinder routine for one gene.
+# For a given ENSG:
+#   1) collect peptide traces,
+#   2) select HDBSCAN clusters,
+#   3) detect peaks within each cluster,
+#   4) estimate peak apex by fitting left/right flanks,
+#   5) bootstrap apex position and height for uncertainty.
+#
+# Output:
+#   A table of candidate protein isoform peaks for the gene, including
+#   peak position, height, bootstrap intervals, and cluster assignment.
+#
+# randomized = TRUE runs the same logic on randomized cluster assignments
+# and is used as a null control for FDR / benchmarking.
+# ------------------------------------------------------------------------------
+
+Isofrac_PeakFinder_newAlg <- function(it,randomized= F,inputSmall=inputSmall,pathAdd="./",clusterType="cl_2"){
+  library(data.table)
+  library(ggplot2)
+  library(pracma)
+  library(parallel)
+  
+  cat("\r PeakFinder",it)
+  # Gene index in the current run
+  ens <- ens_vector[it]
+  
+  # Record which gene is being processed (for traceability / debugging)
+  pathname <- paste(pathAdd,"PeakFinder",sep = "/")
+  try({
+    dir.create(pathname,showWarnings = F)
+    nam <- paste("PeakFinder_it",it,sep = "")
+    write(c(it,ens),paste(pathname,nam,sep = "/"))
+  })
+  
+  PeaksEnsg <- list(Problem="Yes")
+  errorinfo <- try({
+    it <<- it
+    
+    # Select real or randomized traces
+    if(randomized){
+      # Randomized control: same gene, but cluster labels are randomized
+      sel <- inputSmall$dt_gn$ens==ens
+      if(all(!sel)){return(NULL)}
+      
+      hdbscanTable <- inputSmall$hdbscanTables_random[EnsG==ens]
+      dt <- inputSmall$TMTSubset_final_singlenorm_zscore[hdbscanTable$id,]
+      sel2 <- rep(T,dim(dt)[1])
+      
+    }else{
+      # Real data: gene-specific peptide traces and HDBSCAN cluster assignments
+      sel <- inputSmall$dt_gn$ens==ens
+      sel[is.na(sel)] <- F
+      if(all(!sel)){return(NULL)}
+      dt <- inputSmall$TMTSubset_final_singlenorm_zscore[sel,]
+      hdbscanTable <- inputSmall$hdbscanTables[EnsG==ens,]
+      
+      # Match peptide sequences back to HDBSCAN rows
+      hdbscanTable <- hdbscanTable[match(inputSmall$InputTable$Sequence[sel],hdbscanTable$Seq)]
+      
+      # Optional peak/cluster quality filter
+      hdbscanTable$FDR_RF[is.na(hdbscanTable$FDR_RF)]<-1
+      sel2 <- hdbscanTable$FDR_RF<10 
+      sel2[is.na(sel2)] <- F 
+    }
+    
+    # If nothing survives filtering, skip this gene
+    if(all(!sel2)){return(NULL)}
+    
+    library(pracma)
+    
+    hdbscanTable2 <- hdbscanTable
+    dt2 <- dt
+    
+    # Choose which HDBSCAN clustering to use:
+    # cl_2 = main clustering result
+    # cl_3 = alternative clustering resolution
+    if(clusterType=="cl_2"){
+      hdbscanTable2$cl_2[is.na(hdbscanTable2$cl_2)] <- -1
+      cls <- setdiff(unique(hdbscanTable2$cl_2),c(0,-1))
+      hdbscanTable2$UsedClusters <- hdbscanTable2$cl_2
+    }else{
+      hdbscanTable2$cl_3[is.na(hdbscanTable2$cl_3)] <- -1
+      cls <- setdiff(unique(hdbscanTable2$cl_3),c(0,-1))
+      hdbscanTable2$UsedClusters <- hdbscanTable2$cl_3
+    }
+    
+    if(length(cls)==0){
+      return(1)
+    }
+    
+    # Process each non-noise cluster separately
+    PeaksEnsglist <- lapply(sort(cls),function(clsi){
+      cat("\r",clsi)
+      clsi <<- clsi
+      
+      # Extract all peptide traces in this cluster
+      temp <- dt2[hdbscanTable2$UsedClusters==clsi,]
+      temp$id <- 1:dim(temp)[1]
+      
+      # Reformat for the peak-finding helper
+      temp_melt <- melt(temp,id.vars = "id")
+      IdentifyPeaks_SECResults <- IdentifyPeaks_SEC(
+        temp = data.table(value=temp_melt$value,Fraction=gsub("V","",temp_melt$variable))
+      )
+      
+      # Candidate peaks and quantile-based cutoffs
+      fp2 <- IdentifyPeaks_SECResults$PeakQuantiles
+      fp2$StartDiff <- NA
+      fp2$EndDiff    <- NA
+      fp2$PeakSD     <- NA
+      fp2$Q0p5CutOff <- NA
+      fp2$Q1CutOff   <- NA
+      fp2$Q1p5CutOff <- NA
+      fp2$Q2CutOff   <- NA
+      fp2$Median     <- NA
+      fp2$Smooth     <- T
+      fp <- fp2
+      
+      if(length(fp)>0){
+        
+        # Peak apex and confidence are estimated from left/right flank fits
+        Peaks <- sapply(1:dim(fp)[1],function(it,plotstuff=FALSE){
+          PositionTable <- rep(NA,9)
+          try({
+            x <- unlist(fp[it,])
+            
+            # Linear fit on left flank and right flank
+            lm_1 <- lm_checker(x[3],x[2],temp)
+            lm_2 <- lm_checker(x[2],x[4],temp,cutatstart = F)
+            
+            # Intersection of the two fitted lines = peak apex
+            CoefReal <- lmIntx(lm_1$md,lm_2$md)
+            
+            # Bootstrap the flank fits to estimate uncertainty
+            lm_bs <- sapply(1:20,function(it){
+              lm_1 <- lm_checker(x[3],x[2],temp,bootstrap = T)
+              lm_2 <- lm_checker(x[2],x[4],temp,bootstrap = T,cutatstart = F)
+              if(is.na(lm_1$md$coefficients[2])|is.na(lm_2$md$coefficients[2])){
+                CoefReal <- data.frame(x=NA,y=NA)
+              }else{ 
+                CoefReal <- lmIntx(lm_1$md,lm_2$md)
+              }
+              unlist(CoefReal)
+            })
+            quantile_80 <- apply(lm_bs,1,quantile,probs=c(0.1,0.9),na.rm = T)
+            sd_80 <- apply(lm_bs,1,function(x){sd(x,na.rm=T)})
+            
+            # Peak feature table
+            PositionTable <- cbind(
+              CoefReal,
+              t(as.matrix(as.vector(quantile_80))),
+              lm_1$n,
+              t(as.matrix(as.vector(sd_80)))
+            )
+            names(PositionTable) <- c(
+              "Fraction_lm","Height_lm",
+              "Fraction_BS_lo","Fraction_BS_hi",
+              "Height_BS_lo","Height_BS_hi",
+              "n","Fraction_sd_80","Height_sd_80"
+            )
+            PositionTable$Fraction_width <- diff(c(PositionTable$Fraction_BS_lo,PositionTable$Fraction_BS_hi))
+            PositionTable$Height_width   <- diff(c(PositionTable$Height_BS_lo,PositionTable$Height_BS_hi))
+          })
+          
+          cbind(t(as.matrix(x)),PositionTable)
+        })
+        
+        Peaks <- t(Peaks)
+        Peaks <- data.frame(Peaks)
+      }else{
+        return(NULL)
+      }
+      
+      Peaks$cluster2 <- clsi
+      Peaks
+    })
+    
+    # Keep only sufficiently supported peaks
+    PeaksEnsglist2 <<- PeaksEnsglist
+    PeaksEnsg <- rbindlist(PeaksEnsglist[lengths(PeaksEnsglist)>11])
+    PeaksEnsg$ENS <- ens
+  })
+  
+  # Attach error info if something failed
+  if(class(errorinfo)=="try-error"){
+    PeaksEnsg$Details <- errorinfo
+  }
+  PeaksEnsg
+}
+
+# ------------------------------------------------------------------------------
+# Compute the intersection point of two linear fits.
+# Used to estimate peak apex from left and right flank models.
+# ------------------------------------------------------------------------------
+
+lmIntx <- function(fit1, fit2, rnd=2) {
+  b1<- fit1$coefficient[1]
+  m1<- fit1$coefficient[2]
+  b2<- fit2$coefficient[1]
+  m2<- fit2$coefficient[2]
+  df <- data.frame(x=NA, y=NA)
+  
+  if(m1==m2 & b1==b2) {
+    print("Lines are identical")
+  } else if(m1==m2 & b1 != b2) {
+    print("Lines are parallel")
+  } else {
+    x <- (b2-b1)/(m1-m2)
+    y <- m1*x + b1
+    df <- data.frame(x=round(x, rnd), y=round(y, rnd))
+  }
+  df
+}
+
+# ------------------------------------------------------------------------------
+# Fit a line to the left or right flank of a candidate peak.
+# Used to estimate peak apex and to bootstrap the uncertainty of the apex.
+# ------------------------------------------------------------------------------
+
+lm_checker <- function(start,end,df,bootstrap=F,rangeCutoff = 3,cutatstart=T,ggplotstuff=F){
+
+  x1 <- start:end
+  if(cutatstart){
+    if(diff(range(x1))>rangeCutoff){
+      x1 <- (start+rangeCutoff-1):end
+    }
+  }else{
+    if(diff(range(x1))>rangeCutoff){
+      x1 <- (start):(end-rangeCutoff+1)
+    }
+  }
+  
+  x1_all <- lapply(x1,function(itx){
+    data.frame(itx,data.frame(df)[,itx])
+  })
+  x_all <- lapply(1:dim(df)[2],function(itx){
+    data.frame(itx,data.frame(df)[,itx])
+  })
+  x_all <- rbindlist(x_all)
+  x1_all <- rbindlist(x1_all)
+  
+  if(bootstrap){
+    s <- sample(1:dim(x1_all)[1],replace = T)
+    lm_md <- lm(as.numeric(unlist(x1_all[s,2]))~as.numeric(unlist(x1_all[s,1])))
+  }else{
+    lm_md <- lm(as.numeric(unlist(x1_all[,2]))~as.numeric(unlist(x1_all[,1])))
+  }
+  
+  names(x_all) <- c("V1","V2")
+  names(x1_all) <- c("V1","V2")
+  
+  g <- NA
+  try({
+    coef <- coefficients(lm_md)
+    g <- ggplot(x_all,aes(V1,V2))+geom_point()+geom_abline(slope=coef[2],intercept = coef[1])+geom_vline(xintercept = range(x1),lty= "dotted")
+    if(ggplotstuff){
+      print(g)
+    }
+  })
+  
+  list(md=lm_md,x1_all=x1_all,g=g,n=dim(x1_all)[1])
+}
+# ------------------------------------------------------------------------------
+# Plot peptide traces and overlay peak positions / uncertainty bars.
+# Used for QC and for example figures in the manuscript / viewer.
+# ------------------------------------------------------------------------------
+
+ggtraces <- function(input,ens_identifier="ENSG00000120802"){
+  PeakResults_TMPO<- data.table(input$IsoFrac_PeakResultsTable)[ENS==ens_identifier]
+  PeakResults_TMPO$id <- PeakResults_TMPO$cluster2
+  PeakResults_TMPO$cl <- PeakResults_TMPO$cluster2
+  
+  g2 <- Traces_GGplot(input)
+  g3 <- NULL
+  try({
+    g3 <- g2+
+      geom_errorbar(
+        data=PeakResults_TMPO,
+        aes(x=10^unlist(MW_lm),y=unlist(Height_lm),ymin=unlist(Height_BS_lo),ymax=unlist(Height_BS_hi)),
+        color="black"
+      )+
+      geom_errorbarh(
+        data=PeakResults_TMPO,
+        aes(x=10^unlist(MW_lm),y=unlist(Height_lm),xmin=10^unlist(MW_lm_lo),xmax=10^unlist(MW_lm_hi)),
+        color="black"
+      )+
+      xlab("log10 MW")+ylab("cluster zscore [au]")+
+      geom_label_repel(
+        data=PeakResults_TMPO,
+        aes(x=10^unlist(MW_lm),y=unlist(Height_lm),label=round(10^unlist(MW_lm))),
+        size = 2
+      )+
+      geom_point(
+        data=PeakResults_TMPO,
+        aes(10^unlist(MW_lm),unlist(Height_lm),label=round(10^unlist(MW_lm)),group=NULL,color=as.character(cluster2)),
+        color="black"
+      )
+  })
+  
+  list(Traces=g2,TraceAndPoints=g3)
+}
+
+
+# ------------------------------------------------------------------------------
+# Build pairwise peak-comparison tables for one gene.
+# Used to compare peak candidates within the same gene based on estimated MW,
+# fraction width, and cluster quality.
+# ------------------------------------------------------------------------------
+
+NetworkTablesCompiler <- function(ensIT="ENSG00000120802",iprTable){
+  library(data.table)
+  cat("\r",ensIT)
+  temp <- iprTable[ENS==ensIT]
+  
+  if(dim(temp)[1]>1){
+    co <- combn(1:dim(temp)[1],2)
+  }else{
+    co <- matrix(rep(1,2),ncol=1)
+  }
+  temp$FractionWidth = unlist(temp$End)-unlist(temp$Start)
+  
+  Mix <- apply(co,2,function(x){
+    x <<- x
+    a <- temp[x[1]]
+    b <- temp[x[2]]
+    li <- list(
+      c(a$MW_lm,a$MW_lm_gel_hi,a$MW_lm_gel_lo,a$MW_lm_hi,a$MW_lm_lo),
+      c(b$MW_lm,b$MW_lm_gel_hi,b$MW_lm_gel_lo,b$MW_lm_hi,b$MW_lm_lo)
+    )
+    
+    p <- as.double(NA)
+    p2 <- as.double(NA)
+    try({ p  <- wilcox.test(li[[1]],li[[2]])$p.value },silent = T)
+    try({ p2 <- wilcox.test(li[[1]][c(1,4,5)],li[[2]][c(1,4,5)])$p.value },silent = T)
+    
+    t1 <- cbind(a$MW_lm,a$MW_lm,1,1 ,a$Cluster_FDR_RF,a$Cluster_FDR_RF,unlist(a$Height),a$FractionWidth,a$cluster2,length(li[[1]]),length(li[[1]]),a$id,a$id)
+    t2 <- cbind(b$MW_lm,b$MW_lm,1,1 ,b$Cluster_FDR_RF,b$Cluster_FDR_RF,unlist(b$Height),b$FractionWidth,b$cluster2,length(li[[2]]),length(li[[2]]),b$id,b$id)
+    t3 <- cbind(a$MW_lm,b$MW_lm,p,p2,a$Cluster_FDR_RF,b$Cluster_FDR_RF,min(unlist(c(a$Height,b$Height))),max(c(a$FractionWidth,b$FractionWidth)),paste(a$cluster2,b$cluster2,collapse=";"),length(li[[1]]),length(li[[2]]),a$id,b$id)
+    r <- rbind(t1,t2,t3)
+    
+    colnames(r) <- c("from", "to","p","p2","Cl_FDR1","Cl_FDR2","mpw","FractionWidth","Cluster","n1","n2","id1","id2")
+    as.data.table(r)
+  })
+  
+  Mix <- rbindlist(Mix)
+  Mix <- unique(Mix)
+  list(networkTable=Mix,ens=ensIT)
+}
+
+# ------------------------------------------------------------------------------
+# Build a bipartite network for one gene:
+#   peptide sequences -> IsoFrac peak candidates -> optional UniProt entries
+#
+# This is used for visualization and for summarizing how peptide evidence links
+# IsoFrac peaks to database proteins.
+# ------------------------------------------------------------------------------
+
+nw_assembler <- function(input,EnsID,traces_info=NULL,cbPalette =c( "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"),
+                         nodeColors = list(isofrac="#E69F00",db="#CC79A7"),
+                         ProteinSequences=NULL,applyCutoffs=T
+){
+  ip <- input$IdentifiedPeaks_Table
+  hdbscan <- input$hdbscanTables[EnsG==EnsID,,]
+  ipseub <- ip[ENS==EnsID]
+  if(dim(ipseub)[1]==0){
+    return(NULL)
+  }
+  
+  # Optional filtering by peak quality / trace support
+  if(length(traces_info)>0&applyCutoffs){
+    ipseub[,Sel :={
+      tr <- traces_info[Height==Height&
+                        cluster2==unlist(cluster2)&
+                        Peak==unlist(Peak),]
+      dim(tr)[1]>0
+    },.(Height=unlist(Height),cluster2=unlist(cluster2),Peak=unlist(Peak))]
+    ipseub <- ipseub[Sel==TRUE,]
+  }
+  if(dim(ipseub)[1]==0){
+    return(NULL)
+  }
+  
+  # Map each IsoFrac peak candidate to the peptide sequences supporting it
+  CombiVec <- ipseub[,.(Seq={
+    hdbscan[cl_2==.BY$cluster2]$Seq
+  }),.(cluster2,Compressed_MW_Variants,MW_lm_Compressed_)]
+  
+  # Network nodes:
+  # - peptide sequences
+  # - IsoFrac peak candidates
+  # - optional UniProt proteins that match the same sequences
+  nw_nodes1 <- CombiVec[,.(id=.BY$Seq,
+                           value=0,
+                           label=.BY$Seq,
+                           color=colorRampPalette(cbPalette)(max(CombiVec$cluster2))[unique(cluster2)],
+                           group="Seq",shape="dot"),Seq]
+  
+  nw_nodes2 <- CombiVec[,.(id=.BY$Compressed_MW_Variants,
+                           shape="square",
+                           color=nodeColors$isofrac,
+                           value=round(10^round(.BY$MW_lm_Compressed_,2),-3),
+                           label=paste("IsoFrac",paste(round(10^round(.BY$MW_lm_Compressed_,2),-3),"Da"),sep = " # "),
+                           group="MQ",value=0),.(Compressed_MW_Variants,MW_lm_Compressed_)]
+  
+  # Optional database nodes
+  if(length(ProteinSequences)>0){
+    EnsVec <- ProteinSequences[ENSG==ensVec]
+    if(dim(EnsVec)[1]==0){
+      return(NULL)
+    }
+    EnsVecFun <- lapply(hdbscan$Seq,function(x){
+      EnsVecFun <- EnsVec[grep(x,EnsVec$SEQUENCE,fixed = T),]
+      EnsVecFun$Seq <- x
+      unique(EnsVecFun)
+    })
+    EnsVecFun <- unique(rbindlist(EnsVecFun))
+    nw_nodes3 <- data.table(id=paste("UniProt",round(EnsVecFun$MW,-3)),
+                            shape = "triangle",
+                            group="UniProt",
+                            value=round(EnsVecFun$MW,-3),
+                            color=nodeColors$db,
+                            label=paste(EnsVecFun$ProteinID,paste(round(EnsVecFun$MW,-3),"Da"),sep = " # "))
+    nw_nodes3 <- unique(nw_nodes3)
+  }else{
+    nw_nodes3 <- NULL
+  }
+  
+  nw_nodes <- rbind(nw_nodes1,nw_nodes2,nw_nodes3,fill=T)
+  
+  edges <- data.frame(from = CombiVec$Seq, to = CombiVec$Compressed_MW_Variants)
+  if(length(nw_nodes3)>0){
+    edges2 <- data.frame(from = EnsVecFun$Seq, to = paste("UniProt",round(EnsVecFun$MW,-3)))
+    edges <- rbind(edges,edges2)
+  }
+  
+  # Simplified table for export / viewer
+  CombiVec$MW <- NA
+  CombiVec$Score <- NA
+  setcolorder(CombiVec,c("Seq","cluster2","MW","MW_lm_Compressed_","Score"))
+  AssembledTable <- CombiVec
+  names(AssembledTable) <- c("Seq","Cl","MW","MW_obs","Score","Cl_variants")
+  
+  list(edges=edges,nodes=nw_nodes,AssembledTable=AssembledTable)
+}
+
+
+# ------------------------------------------------------------------------------
+# Plot the network created by nw_assembler().
+# Supports either visNetwork (interactive) or igraph (static / similarity matrix).
+# ------------------------------------------------------------------------------
+
+nw_plot <- function(nw_assembler_output,NetSet="Both",nodeColors = list(isofrac="#E69F00",db="#CC79A7"),type="VizPlot",addedInfo="UniProt"){
+  v=NULL
+  p=NULL
+  nw <- nw_assembler_output
+  
+  if(type=="VizPlot"&require(visNetwork)){
+    if(NetSet=="Both"){
+      sel <- rep(T,dim(nw$nodes)[1])
+    }
+    if(NetSet=="Ensembl"){
+      sel <- grepl(paste(addedInfo,"|Seq"),nw$nodes$group)
+    }
+    if(NetSet=="IsoFrac"){
+      sel <- grepl("MQ|Seq",nw$nodes$group)
+    }
+    
+    v <- visNetwork(edges = nw$edges,nodes=nw$nodes[sel,]) %>% visOptions(manipulation = TRUE)
+    v <- v%>%visGroups(groupname = "Uniprot", color = nodeColors$isofrac,shape="square") %>%
+      visGroups(groupname = "IsoFrac", color = nodeColors$db,shape="triangle") %>%visLegend() 
+  }
+  
+  if(type=="igraph"&require(igraph)){
+    nw_edges <- nw$edges
+    v <- graph_from_data_frame(nw_edges,directed = F)
+    
+    # Color and shape nodes based on their group
+    co <- sapply(attributes(V(v))$names,function(x){
+      nw$nodes[id==x]$color
+    })
+    sh <- sapply(attributes(V(v))$names,function(x){
+      nw$nodes[id==x]$shape
+    })
+    
+    co[lengths(co)==0] <- "grey"
+    sh[lengths(sh)==0] <- "circle"
+    sh <- unlist(sh)
+    sh[sh=="triangle"] <- "square"
+    sh[sh=="dot"] <- "circle"
+    
+    V(v)$color <- unlist(co)
+    V(v)$shape <- unlist(sh)
+    V(v)$size=5
+    V(v)$label.cex=0.4
+    V(v)$label.dist = 1
+    
+    # Similarity matrix for non-peptide nodes
+    Vertice <- V(v)
+    NodesOfInterest <- nw$nodes[shape!="dot",]
+    Label <- paste(NodesOfInterest$id)
+    sel <- which(!is.na(match(attributes(Vertice)$name,Label)))
+    v_simi <- igraph::similarity(v,V(v)[sel])
+    
+    p <- NULL
+    try({
+      colnames(v_simi) <- nw$nodes[match(attributes(V(v)[sel])$names,id)]$label
+      rownames(v_simi) <- nw$nodes[match(attributes(V(v)[sel])$names,id)]$label
+      p <- pheatmap(v_simi,silent = T)
+    })
+    
+    # Convert similarity matrix into a long table for downstream interpretation
+    si_list <- NULL
+    try({
+      si_list <- lapply(2:dim(v_simi)[2],function(it){
+        si <- v_simi[1:(it-1),it]
+        co_ori <- rownames(v_simi)[1:(it-1)]
+        co2_ori <- colnames(v_simi)[it]
+        co <- strsplit(co_ori," # ")
+        co2 <- strsplit(co2_ori," # ")
+        
+        data.frame(I1=co_ori,                
+                   I2=co2_ori,
+                   T1=sapply(co,"[[",1),
+                   T2=sapply(co2,"[[",1),
+                   MW1=gsub(" Da","",sapply(co,"[[",2)),
+                   MW2=gsub(" Da","",sapply(co2,"[[",2)),
+                   similarity=si)
+      })
+      si_list <- rbindlist(si_list)
+      si_list$Delta_MW <- as.numeric(si_list$MW1)-as.numeric(si_list$MW2)
+    })
+    
+    list(v=v,p=p,type=type,simi_matrix=v_simi,simiList =si_list)
+  }
+}
+
+
+# ------------------------------------------------------------------------------
+# Filter a peak table for one gene and return peaks in a requested score / SD range.
+# Used to pick candidate peaks for network assembly and manual inspection.
+# ------------------------------------------------------------------------------
+
+traces_info_crawler <- function(input,EnsID="ENSG00000120802",seqFDR=1,sd80=c(0,2),PeakScore=0.15){
+  PeakResults_TMPO <- data.table(input$IsoFrac_PeakResultsTable)[ENS==EnsID]
+  PeakResults_TMPO$id <- PeakResults_TMPO$cluster2
+  PeakResults_TMPO$cl <- PeakResults_TMPO$cluster2 
+  
+  # Filter on bootstrap-based fraction uncertainty
+  PeakResults_TMPOfil <- PeakResults_TMPO
+  PeakResults_TMPOfil <- PeakResults_TMPOfil[unlist(Fraction_sd_80)>=sd80[1]&unlist(Fraction_sd_80)<=sd80[2]]
+  PeakResults_TMPOfil
+}
+
+
+
+## New Functions for new PeakfinderAlgorithm
+
+# ------------------------------------------------------------------------------
+# HZ_Smooth
+# Lightweight smoothing of fraction traces before peak detection.
+# - Sorts fractions if an order vector is provided.
+# - Applies a simple 3-point moving average twice.
+# - Used to reduce local jitter while preserving the overall elution shape.
+# - Returns the smoothed trace together with the original order.
+# ------------------------------------------------------------------------------
+
+HZ_Smooth <- function(x, OrderVec=NULL, window=1){
+  initialid <- 1:length(x)
+
+  # If a fraction order vector is provided, sort trace values by fraction order
+  if(length(OrderVec) == length(x)){
+    sortVec <- order(as.numeric(OrderVec))
+    x <- x[sortVec]
+    initialid <- initialid[sortVec]
+    OrderVec <- OrderVec[sortVec]
+  }
+
+  id <- 1:length(x)
+
+  # First smoothing pass: mean of each point and its immediate neighbors
+  av <- sapply(id, function(y){
+    sel <- id >= (y-1) & id <= (y+1)
+    hu <- x[sel]
+    mean(hu, na.rm = TRUE)
+  })
+
+  # Second smoothing pass on the already smoothed trace
+  av2 <- sapply(id, function(y){
+    sel <- id >= (y-1) & id <= (y+1)
+    hu <- av[sel]
+    mean(hu, na.rm = TRUE)
+  })
+
+  df <- data.table(original = x, OrderVec = OrderVec, av1 = av, av2 = av2, id = initialid)
+  df[order(id),]
+}
+
+# ------------------------------------------------------------------------------
+# findpeaks_mod_v2
+# Wrapper around pracma::findpeaks for fraction-based traces.
+# - Collapses peptide traces to a median profile per fraction.
+# - Detects local maxima on the smoothed / summarized trace.
+# - Converts peak positions back to the original fraction labels.
+#
+# In IsoFrac PeakFinder, this is used to identify candidate protein isoform peaks
+# from peptide clusters within a gene.
+# ------------------------------------------------------------------------------
+
+findpeaks_mod_v2 <- function(x, OrderVec=NULL, ...){
+  require(pracma)
+
+  input <- data.table(Median_Intensity_2 = x, variable = OrderVec)
+  input$OrderVec <- as.numeric(as.character(input$OrderVec))
+
+  # Median signal per fraction
+  Median_Matrix <- input[, median(Median_Intensity_2, na.rm = TRUE), variable]
+  Median_Matrix <- Median_Matrix[order(variable)]
+
+  # Peak detection on the fraction profile
+  Peaks <- findpeaks(as.numeric(Median_Matrix$V1), ...)
+  if(length(Peaks) > 0){
+    colnames(Peaks) <- c("Intensity", "Peak", "Start", "End")
+    Peaks <- data.table(Peaks)
+
+    # Map peak coordinates back to fraction labels
+    Peaks$Peak  <- Median_Matrix[Peaks$Peak]$variable
+    Peaks$Start <- Median_Matrix[Peaks$Start]$variable
+    Peaks$End   <- Median_Matrix[Peaks$End]$variable
+  }
+
+  Peaks
+}
+
+# ------------------------------------------------------------------------------
+# IdentifyPeaks_SEC
+# Main peak-identification routine for one cluster of peptide traces.
+#
+# Purpose:
+# - Start from a set of peptide fraction traces for one HDBSCAN cluster.
+# - Smooth the traces lightly.
+# - Build a z-scored consensus trace.
+# - Detect initial candidate peaks.
+# - Refine each peak with a Gaussian-like model and bootstrap-based uncertainty.
+#
+# Output:
+# - PeakQuantiles: table of candidate protein isoform peaks with uncertainty,
+#   model fit statistics, and peak positions.
+# - MDResults: list of fitted peak models / diagnostics.
+# ------------------------------------------------------------------------------
+
+IdentifyPeaks_SEC <- function(temp, bs = 20){
+  # temp must contain at least:
+  #   - value: peptide intensity
+  #   - Fraction or OrderVec: fraction index / order of fractions
+  ick <<- temp
+
+  # If no explicit order vector is provided, use the fraction number
+  if(length(temp$OrderVec) == 0){
+    temp$OrderVec <- as.numeric(temp$Fraction)
+  }
+
+  # Smooth the trace before peak detection
+  SmoothedData <- HZ_Smooth(temp$value, temp$OrderVec)
+
+  # Store smoothed traces back into the table
+  temp$av1 <- SmoothedData[order(OrderVec)]$av1
+  temp$av2 <- SmoothedData[order(OrderVec)]$av2
+
+  # Z-score the smoothed profile so peak shape matters more than absolute scale
+  temp$av2_zscore <- scale(temp$av2)
+
+  # Initial peak detection on the z-scored smoothed consensus profile
+  Peaks_init <- findpeaks_mod_v2(temp$av2_zscore, as.numeric(temp$Fraction), nups = 2, ndowns = 2)
+  if(any(class(Peaks_init) == "NULL")){
+    Peaks_init <- data.table()
+  }
+  Peaks_init$Type <- Peaks_init$Peak
+
+  # Margin around the detected peak used for refinement
+  marginAdd <- 3
+  Peaks <- data.table()
+
+  if(dim(Peaks_init)[1] > 0){
+
+    # Bootstrap the cluster profile to estimate how stable each peak is
+    PeakList_bs_all <- lapply(1:bs, function(x){
+      tempSampled <- temp[sample(1:dim(temp)[1], replace = TRUE)]
+      tempSampled$variable <- as.numeric(as.character(tempSampled$OrderVec))
+
+      # Re-evaluate each initial peak on the resampled trace
+      PeaksPoint <- lapply(1:dim(Peaks_init)[1], function(i){
+        try({
+          tempi <- tempSampled[
+            variable >= (Peaks_init[i]$Start - marginAdd) &
+            variable <= (Peaks_init[i]$End + marginAdd)
+          ]
+        })
+
+        PeaksTemp <- NULL
+        try({
+          PeaksTemp <- findpeaks_mod_v2(
+            tempi$av2_zscore,
+            as.numeric(tempi$OrderVec),
+            nups = 2,
+            ndowns = 2
+          )
+          if(length(PeaksTemp) > 0){
+            PeaksTemp$Type <- Peaks_init[i]$Peak
+            PeaksTemp$Height <- Peaks_init[i]$Intensity
+          }
+        }, silent = TRUE)
+
+        PeaksTemp
+      })
+
+      PeaksPoint <- rbindlist(PeaksPoint, fill = TRUE)
+      Peaks <- rbind(Peaks, PeaksPoint, fill = TRUE)
+
+      if(dim(Peaks)[1] == 0){
+        Peaks <- NULL
+      }
+
+      Peaks
+    })
+
+  }else{
+    PeakList_bs_all <- list()
+  }
+
+  # Combine bootstrap peak calls
+  PeakDt <- rbindlist(PeakList_bs_all, fill = TRUE)
+
+  # Quantiles of peak position from bootstrap replicates
+  PeakQuantiles <- NULL
+  try({
+    if(dim(PeakDt)[1] > 0){
+      PeakQuantiles <- PeakDt[, as.list(quantile(Peak, c(0.1, 0.9), na.rm = TRUE)), .(Type, Height)]
+    }
+  })
+
+  # Attach bootstrap quantiles to the initial peak table
+  PeakQuantiles_v2 <- cbind(Peaks_init, PeakQuantiles[match(Peaks_init$Peak, PeakQuantiles$Type)])
+
+  # --------------------------------------------------------------------------
+  # PeakCheck:
+  # Fit a Gaussian-like model to the peak region.
+  # This is used as a shape check and to quantify how well the peak resembles
+  # a smooth, centered protein isoform signal.
+  # --------------------------------------------------------------------------
+
+  PeakCheck <- function(x, y){
+    shiftvalue <- 0
+    if(any(y < 0)){
+      shiftvalue <- abs(min(y)) + 0.000001
+    }
+    y <- y + shiftvalue
+
+    # Keep only positive values for fitting
+    valid <- y > 0
+    x_valid <- x[valid]
+    y_valid <- y[valid]
+    y_valid <- y_valid / max(y_valid)
+
+    gauss_model_centered <- list()
+    gauss_model <- list()
+
+    if(length(x) > 3){
+      rm("gauss_model_centered")
+
+      # Centered Gaussian: x is already shifted around the peak apex
+      try({
+        error <- TRUE
+        sigmavalue <- 0
+        while(error){
+          sigmavalue <- sigmavalue + 1
+          test <- try({
+            gauss_model_centered <- nls(
+              y_valid ~ A * exp(- x_valid^2 / (2 * sigma^2)),
+              start = list(A = 0.1, sigma = sigmavalue),
+              lower = list(A = -10, sigma = 1e-6),
+              upper = list(A = 10, sigma = 100),
+              algorithm = "port"
+            )
+          })
+          if(class(test) != "try-error" | sigmavalue > 50){
+            error <- FALSE
+          }
+        }
+      })
+
+      # Non-centered Gaussian: estimate a free mean (mu) as a reference fit
+      try({
+        mydata <- data.frame(x = x_valid, y = y_valid)
+        gauss_model <- nls(
+          y ~ A * exp(- (x - mu)^2 / (2 * sigma^2)),
+          data = mydata,
+          start = list(A = max(mydata$y), mu = mean(mydata$x), sigma = sd(mydata$x)),
+          lower = list(A = -Inf, mu = min(mydata$x), sigma = 1e-6),
+          upper = list(A = Inf, mu = max(mydata$x), sigma = Inf),
+          algorithm = "port"
+        )
+      })
+    }
+
+    # Predicted values for both fits
+    try({ p  <- predict(gauss_model_centered, x_valid) })
+    try({ p2 <- predict(gauss_model, x_valid) })
+
+    # Residual / fit quality for centered model
+    try({
+      y_pred <- p
+      residuals <- y_valid - y_pred
+    })
+    rss <- as.double(NA)
+    tss <- as.double(NA)
+    try({
+      rss <- sum(residuals^2)
+      tss <- sum((y_valid - mean(y_valid))^2)
+    })
+
+    sigma <- as.double(NA)
+    r_squared <- as.double(NA)
+    try({
+      r_squared <- 1 - rss / tss
+      sigma <- summary(gauss_model_centered)$sigma
+    })
+
+    y_predicted <- as.double(NA)
+    try({
+      y_predicted <- predict(gauss_model_centered) * max(y)
+    })
+
+    # Residual / fit quality for non-centered model
+    try({
+      y_pred2 <- p2
+      residuals2 <- y_valid - y_pred2
+    })
+    rss2 <- as.double(NA)
+    tss2 <- as.double(NA)
+    try({
+      rss2 <- sum(residuals2^2)
+      tss2 <- sum((y_valid - mean(y_valid))^2)
+    })
+
+    sigma2 <- as.double(NA)
+    r_squared2 <- as.double(NA)
+    try({
+      r_squared2 <- 1 - rss / tss
+      sigma2 <- summary(gauss_model)$sigma
+    })
+
+    y_predicted2 <- as.double(NA)
+    try({
+      y_predicted2 <- predict(gauss_model, y_valid)
+      y_predicted2 <- y_predicted2 * max(y)
+    })
+
+    Peak_fit <- NA
+    try({
+      Peak_fit <- coef(gauss_model)["A"]
+    })
+
+    # Return fit diagnostics for one peak
+    list(
+      sigma = sigma,
+      r_squared = r_squared,
+      md = gauss_model_centered,
+      x_valid = x_valid,
+      shiftvalue = shiftvalue,
+      y_predicted = y_predicted,
+      sigma_nc = sigma2,
+      r_squared_nc = r_squared2,
+      md_nc = gauss_model,
+      y_predicted_nc = y_predicted2,
+      Peak_fit = Peak_fit
+    )
+  }
+
+  # Wrapper: apply PeakCheck to a given peak window
+  PeakCheck_Wrapper <- function(x, fraction, gr){
+    nls_results <- NULL
+    try({
+      print(gr)
+      tempfun <- data.table(value = x, variable = as.numeric(fraction))
+      tempii <<- tempfun[
+        as.numeric(variable) >= (as.numeric(gr$Start) - marginAdd) &
+        as.numeric(variable) <= (as.numeric(gr$End) + marginAdd)
+      ]
+      tempii$variable <- as.numeric(as.character(tempii$variable))
+      nls_results <- PeakCheck(as.numeric(as.character(tempii$variable)) - gr$Peak, tempii$value)
+    })
+    nls_results
+  }
+
+  # Peak-specific Gaussian fit results
+  PeakQuantilesTemp <- lapply(split(Peaks_init, Peaks_init$Peak), function(gr){
+    gr <- gr
+    nls_results <- list()
+
+    try({
+      nls_results <- PeakCheck_Wrapper(temp$av2_zscore, temp$OrderVec, gr)
+
+      # Quick diagnostic plot object stored in the results
+      nls_results$Peak <- ggplot(temp, aes(as.numeric(OrderVec), av2_zscore)) +
+        geom_point() +
+        geom_line(
+          data = data.frame(a = nls_results$x_valid + gr$Peak, b = nls_results$y_predicted, id = NA),
+          aes(x = a, y = b),
+          color = "darkorange", lwd = 1, lty = "solid"
+        ) +
+        geom_line(
+          data = data.frame(a = nls_results$x_valid + gr$Peak, b = nls_results$y_predicted_nc, id = NA),
+          aes(x = a, y = b),
+          color = "turquoise", lwd = 1, lty = "dotted"
+        )
+    })
+
+    nls_results$X_shift <- gr$Peak
+    nls_results
+  })
+
+  # Attach fit statistics to the peak table
+  if(length(PeakQuantiles_v2$Type) != 0){
+    PeakQuantiles_v2[, c("r.squared","sigma","x_shift") := {
+      si <- as.double(NA)
+      rs <- as.double(NA)
+      PeakShift <- as.double(NA)
+      gr <- .BY
+
+      if(!is.na(as.numeric(gr$Type))){
+        pa <- PeakQuantilesTemp[[which(gr$Type == as.numeric(names(PeakQuantilesTemp)))]]
+
+        try({ si <- pa$sigma })
+        try({ rs <- pa$r_squared })
+        try({
+          if(length(pa$Peak_fit) > 0){
+            PeakShift <- pa$Peak_fit
+          }
+        })
+      }
+
+      list(si, rs, PeakShift)
+    }, Type]
+  }
+
+  # Final output:
+  # - PeakQuantiles: peak table with bootstrap and fit metrics
+  # - MDResults: per-peak Gaussian model diagnostics
+  list(PeakQuantiles = PeakQuantiles_v2, MDResults = PeakQuantilesTemp)
+}
+
+hu <- Isofrac_PeakFinder_newAlg(15,inputSmall=inputSmall,pathAdd=paste(".",xname,sep="/"))
+```
+
+## PeakFinder
+This section runs the full peak-finding pipeline for all genes in each experiment (gel). High-level steps:
+	1.	Initialize h2o (for peak-quality prediction) and required parallel resources.
+	2.	Load and merge peak candidate sets created from forward and reverse trace analyses (these form positive and negative training sets for PeakFDR).
+	3.	For each gene:
+	  -	Build a robust average profile across peptides in the selected cluster(s).
+	  -	Detect candidate peaks (local maxima) on the average profile.
+	  -	For each candidate peak: fit left and right flank LM, bootstrap to estimate uncertainty in fraction & height.
+	  -	Store a rich set of features for each peak (height, fraction, fraction width, bootstrap SD, cluster FDR measures, etc.).
+	4.	Convert fraction coordinates into estimated MWs by applying pre-trained MW models for each gel.
+	5.	Collapse similar peaks across the same gene into “Compressed MW Variants” (peak identity clustering) using network clique finding on similarity of fraction positions.
+	6.	Run PeakQuality models (Random Forest / Deep Learning) trained on simulated “good” and “bad” peaks to assign a data-driven peak score.
+	7.	Save the results and export a slimmed object.
+
+Important design choices explained simply:
+	  -	We use average profiles (bootstrap median across peptides) because single peptides are noisy. Taking a median across resampled subsets improves robustness.
+	  -	Peak apex estimation relies on the intersection of two linear fits to the left and right flanks. This is a simple, interpretable way to estimate apex fraction even with partially missing data.
+	  -	Bootstrapping flank fits gives confidence intervals (we report fraction and height CI), which are used to filter unreliable peaks.
+	  -	We compare real data to randomized cluster assignments to get a null distribution and estimate FDR-like behavior for peak features.
+
+```{r PeakFinder}
+
+# ------------------------------------------------------------------------------
+# PeakFinder driver script
+#
+# This block runs the full PeakFinder workflow for all gels / experiments:
+#   1) train an HDBSCAN-based peak-quality classifier,
+#   2) estimate FDR for candidate peaks,
+#   3) run the per-gene peak finder,
+#   4) compress redundant peaks into IsoFrac protein isoform candidates,
+#   5) store the results for the viewer and downstream analysis.
+#
+# The workflow is applied separately to each gel / experiment.
+# ------------------------------------------------------------------------------
+
+threads <- 100
+dir.create("Peakfinder")
+setwd("Peakfinder")
+
+# In some runs the first entry is a helper object and is removed here.
+if(length(TableListNormEnsHdbScanMW_noSeq_noMD) == 4){
+  TableListNormEnsHdbScanMW_noSeq_noMD <- TableListNormEnsHdbScanMW_noSeq_noMD[2:4]
+}
+
+lapply(TableListNormEnsHdbScanMW_noSeq_noMD, function(x){ x$xname })
+input <- TableListNormEnsHdbScanMW_noSeq_noMD[[2]]
+input$xname
+
+# ------------------------------------------------------------------------------
+# Main PeakFinder loop over all gels
+# - Each input object contains gene-centric peptide traces and HDBSCAN clusters.
+# - For each gel, we train / apply a peak-quality model and then run PeakFinder.
+# ------------------------------------------------------------------------------
+
+if(!file.exists("TableListNormEnsHdbScanMW_Peaks9_newAlg.rda") | rerun){
+
+  getlistNames <- sapply(TableListNormEnsHdbScanMW_noSeq_noMD, function(x){ x$xname })
+
+  TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_noSeq_noMD, function(input){
+    setwd(MainWD)
+
+    print("Analysing")
+    print(input$xname)
+    input <<- input
+
+    # Create a working directory for this gel / experiment
+    xname <- gsub(".txt$", "", make.names(input$xname))
+    xname <- paste("h2o_FDR_PeakFinder", xname, sep = "_")
+    dir.create(xname)
+    setwd(xname)
+
+    # HDBSCAN results:
+    #   - li1 = randomized control
+    #   - li2 = real cluster assignments
+    li1 <- input$hdbscanTables_random
+    li2 <- input$hdbscanTables
+
+    # ----------------------------------------------------------------------------
+    # Train an HDBSCAN cluster classifier (Random Forest / optional DeepLearning)
+    # ----------------------------------------------------------------------------
+    if(!file.exists(paste(".", xname, "TableListNormEnsHdbScan_random_ML.rda", sep = "/")) | rerun){
+
+      dir.create(cuw <- paste("HDBSCAN_ML", sep = "/"))
+      wd1 <- getwd()
+      wd2 <- getwd()
+
+      # Label real vs randomized rows for supervised training
+      li1$Score <- 0
+      li2$Score <- 1
+
+      tabi <- rbind(li1, li2)
+      tabi$Abu <- as.numeric(as.character(tabi$Abu))
+      tabi$Seq <- NULL
+      tabi$id <- NULL
+      tabi$sc_2[is.na(tabi$sc_2)] <- 0
+      tabi$sc_3[is.na(tabi$sc_3)] <- 0
+
+      TrainingFun <- lapply(list(tabi), function(x){
+        print("Round")
+        xfun <- x
+        xfun$EnsG <- NULL
+        xfun$cl_2 <- NULL
+        xfun$cl_3 <- NULL
+
+        print(dim(xfun))
+        print("Training Data")
+
+        # H2O frame for classifier training
+        train.h2o <- as.h2o(xfun)
+
+        # Random forest is the main peak-quality model
+        print("RandomForest")
+        isofrac_rf <- h2o.randomForest(training_frame = train.h2o, y = "Score", nfolds = 10)
+
+        rfname <- paste(
+          "ML_hdbscan_rf_",
+          paste(c("2","3")[c(any(grepl("2", names(x))), any(grepl("[cps]_3", names(x))))], collapse = "_"),
+          sep = ""
+        )
+
+        h2o.save_mojo(isofrac_rf, paste(xname, "HDBSCAN_ML", rfname, sep = "/"), force = TRUE)
+
+        # Predict peak quality for all rows
+        scores <- predict(isofrac_rf, train.h2o)
+        scores <- as.data.frame(scores)
+        x$Prediction_rf <- scores$predict
+
+        # Deep learning was tested but not used in the final workflow
+        x$Prediction_dl <- 0
+
+        list(x)
+      })
+
+      graphics.off()
+      setwd("../")
+      save(TrainingFun, file = paste(".", xname, "TableListNormEnsHdbScan_random_ML.rda", sep = "/"))
+
+    }else{
+      if(basename(getwd()) == xname){
+        setwd("../")
+      }
+      load(paste(".", xname, "TableListNormEnsHdbScan_random_ML.rda", sep = "/"))
+    }
+
+    print("loaded TableListNormEnsHdbScan_random_ML")
+    graphics.off()
+
+    # ----------------------------------------------------------------------------
+    # Evaluate classifier performance and derive an empirical FDR curve
+    # ----------------------------------------------------------------------------
+    library(pROC)
+
+    lapply(TrainingFun, function(y){
+      prf <- y[[1]]
+
+      r  <- roc(prf$Score, prf$Prediction_rf)
+      dl <- roc(prf$Score, prf$Prediction_dl)
+
+      plot(r, main = "rf")
+      points(dl$specificities, dl$sensitivities, col = 2, lty = "dotted", type = "l")
+      legend("bottomright", legend = paste(c("RF","DL"), c(round(r$auc,3), round(dl$auc,3))))
+      NULL
+    })
+
+    # Construct a simple FDR curve from the ranked randomized / real scores
+    tabi <- TrainingFun[[1]][[1]]
+    FDRtemp <- tabi[order(tabi$Prediction_rf, decreasing = TRUE),]
+    wh <- which(FDRtemp$Score == 0)
+    fdr <- (1:length(wh)) / wh
+
+    pdf(paste(".", xname, "FDRTest.pdf", sep = "/"))
+    plot(FDRtemp$Prediction_rf[wh], fdr, type = "l", main = "Score", lwd = 5)
+
+    dt_fdr <- data.table(score = FDRtemp$Prediction_rf[wh], fdr = fdr, cut = cut(FDRtemp$Prediction_rf[wh], 1000))
+    dt_fdr <- dt_fdr[, .(score = mean(score), fdr = mean(fdr)), cut]
+
+    FDRPREDICt <- loess(c(dt_fdr$fdr, rep(0,10)) ~ c(dt_fdr$score, 1.1:10.1), span = 0.3)
+    so <- order(FDRPREDICt$x)
+    points(FDRPREDICt$x[so], FDRPREDICt$fitted[so], type = "l", col = 2, lty = "solid", lwd = 2)
+
+    abline(h = 0.01)
+    abline(h = 0.05)
+    abline(h = 0.1)
+
+    tabi$FDR <- predict(FDRPREDICt, TrainingFun[[1]][[1]]$Prediction_rf)
+    dev.off()
+
+    # Attach RF-based FDR estimates back to real and randomized HDBSCAN tables
+    input$hdbscanTables$FDR_RF <- tabi$FDR[tabi$Score == 1]
+    input$hdbscanTables_random$FDR_RF <- tabi$FDR[tabi$Score == 0]
+
+    # ----------------------------------------------------------------------------
+    # Summarize number of clusters / isoform candidates per gene under different
+    # FDR thresholds. This gives a quick view of how the score cutoff affects yield.
+    # ----------------------------------------------------------------------------
+    il <- input$hdbscanTables
+
+    ISOFORMS <- il[, .(
+      all          = length(unique(cl_2 > 0)),
+      FDR_RF_1pr   = length(unique(cl_2[FDR_RF < 0.01 & cl_2 != 0])),
+      FDR_RF_5pr   = length(unique(cl_2[FDR_RF < 0.05 & cl_2 != 0])),
+      FDR_RF_10pr  = length(unique(cl_2[FDR_RF < 0.1  & cl_2 != 0]))
+    ), EnsG]
+
+    isomelt <- melt(ISOFORMS)
+    isomeltList <- isomelt[, .(
+      hu = as.list(table(value)),
+      ha = as.list(names(table(value)))
+    ), variable]
+
+    pdf(pdfname <- paste(".", xname, "TraceFDR_barplots_Genes.pdf", sep = "/"), width = 10)
+    library(gridExtra)
+    g1 <- ggplot(isomeltList[grep("1pr", variable)], aes(as.numeric(unlist(ha)), unlist(hu), fill = variable)) +
+      geom_bar(position = "dodge", stat = "identity") +
+      xlab("HDBSCAN Clusters") + ylab("Genes") + xlim(-1, 10) + ylim(c(0, 9000))
+    g2 <- ggplot(isomeltList[grep("5pr", variable)], aes(as.numeric(unlist(ha)), unlist(hu), fill = variable)) +
+      geom_bar(position = "dodge", stat = "identity") +
+      xlab("HDBSCAN Clusters") + ylab("Genes") + xlim(-1, 10) + ylim(c(0, 9000))
+    g3 <- ggplot(isomeltList[grep("10pr", variable)], aes(as.numeric(unlist(ha)), unlist(hu), fill = variable)) +
+      geom_bar(position = "dodge", stat = "identity") +
+      xlab("HDBSCAN Clusters") + ylab("Genes") + xlim(-1, 10) + ylim(c(0, 9000))
+    grid.arrange(g1, g2, g3, nrow = 1)
+    dev.off()
+    system(paste("open", pdfname))
+
+    # ----------------------------------------------------------------------------
+    # Peak finding per gene
+    # ----------------------------------------------------------------------------
+    ens_vector <- unique(input$dt_gn$ens)
+    setwd(MainWD)
+
+    rdapath <- paste(".", xname, "PeakFinder_Subset.rda", sep = "/")
+    if(!file.exists(rdapath) | rerun){
+
+      PeakFinder <- try({
+
+        graphics.off()
+        library(parallel)
+
+        # Build input object for the per-gene PeakFinder routine
+        ENs_listpath <- paste(".", xname, "ENS_List.rda", sep = "/")
+        if(!file.exists(ENs_listpath) | rerun){
+
+          inputSmall <- list()
+          inputSmall$hdbscanTables_random <- input$hdbscanTables_random
+          inputSmall$hdbscanTables <- input$hdbscanTables
+          inputSmall$TMTSubset_final_singlenorm_zscore <- input$TMTSubset_final_singlenorm_zscore
+          inputSmall$dt_gn <- input$dt_gn
+          inputSmall$InputTable <- data.frame(Sequence = input$InputTable$Sequence)
+          ens_vector <- unique(input$dt_gn$ens)
+
+          try(stopCluster(cl), silent = TRUE)
+          print("Starting Cluster")
+          cl <- makeCluster(threads, outfile = "outfile.txt")
+
+          if(!file.exists(ENs_listpath)){
+            hu <- try({
+              save(inputSmall, ens_vector, lmIntx, lm_checker, Isofrac_PeakFinder_newAlg, HZ_Smooth, file = "Isofrac_PeakFinder.rda")
+              clusterExport(cl, list("ens_vector", "lmIntx", "lm_checker", "HZ_Smooth", "IdentifyPeaks_SEC", "findpeaks_mod_v2"), envir = environment())
+
+              print("Exported Cluster")
+
+              # Run peak finding on real data
+              itvec <- (1:length(unique(ens_vector)))
+              ENS_List <- parLapply(cl, itvec, Isofrac_PeakFinder_newAlg, inputSmall = inputSmall, pathAdd = paste(".", xname, sep = "/"))
+              save(ENS_List, file = ENs_listpath)
+
+              # Run peak finding on randomized data (null control)
+              print("Started Peakfinding cl_2 random")
+              ENS_List_rev <- parLapply(cl, sample(itvec), Isofrac_PeakFinder_newAlg, inputSmall = inputSmall, randomized = TRUE, pathAdd = paste(".", xname, sep = "/"))
+              save(ENS_List, ENS_List_rev, file = ENs_listpath)
+
+            })
+
+            hu <- try({
+              # Alternative HDBSCAN resolution (cl_3)
+              print("Started Peakfinding cl_3")
+              ENS_List_cl_3 <- parLapply(cl, sample(itvec), Isofrac_PeakFinder_newAlg, inputSmall = inputSmall, pathAdd = paste(".", xname, sep = "/"), clusterType = "cl_3")
+              save(ENS_List, ENS_List_rev, ENS_List_cl_3, file = ENs_listpath)
+
+              print("Started Peakfinding cl_3 random")
+              ENS_List_rev_cl_3 <- parLapply(cl, sample(itvec), Isofrac_PeakFinder_newAlg, inputSmall = inputSmall, randomized = TRUE, pathAdd = paste(".", xname, sep = "/"), clusterType = "cl_3")
+              save(ENS_List, ENS_List_rev, ENS_List_cl_3, ENS_List_rev_cl_3, file = ENs_listpath)
+            })
+          }else{
+            load(ENs_listpath)
+          }
+
+          stopCluster(cl)
+          rm("cl")
+        }else{
+          load(ENs_listpath)
+        }
+
+        # ----------------------------------------------------------------------------
+        # Convert peak candidates into final IsoFrac peak tables
+        # ----------------------------------------------------------------------------
+        Isopath <- paste(".", xname, "IsoFrac_PeakResults.rda", sep = "/")
+        if(!file.exists("Isopath") | rerun){
+
+          # Keep only sufficiently well-supported peak objects
+          hm <- rbindlist(ENS_List[lengths(ENS_List) > 18], fill = TRUE)
+          hm <- as.data.frame(hm)
+          hm_rev <- rbindlist(ENS_List_rev[lengths(ENS_List_rev) > 18], fill = TRUE)
+
+          # Training labels for FDR estimation:
+          #   score = 1 for real peaks, score = 0 for randomized control peaks
+          hm$score <- 1
+          hm_rev$score <- 0
+
+          hm_all <- rbind(hm, hm_rev)
+          hm_all$ENS <- NULL
+          hm_all$Height_SD <- NULL
+          hm_all$Height_SD_all <- NULL
+          hm_all$Fraction_SD <- NULL
+          hm_all$Fraction_SD_all <- NULL
+          hm_all$cluster2 <- NULL
+          colnames(hm_all)[dupl <- duplicated(colnames(hm_all))]
+          if(any(dupl)){
+            hm_all <- data.frame(hm_all)[, -dupl]
+          }
+          hm_all <- as.data.table(hm_all)
+
+          hm_all_temp <- apply(hm_all, 2, function(x){
+            x[lengths(x) == 0] <- NA
+            xl <- unlist(x)
+            if(length(x) != length(xl)){
+              stop()
+            }
+            xl
+          })
+          hm_all_temp <- data.frame(hm_all_temp)
+
+          h2odt <- as.h2o(hm_all_temp)
+          h2odt_md <- h2o.randomForest(training_frame = h2odt, y = "score", nfolds = 10)
+
+          AllScore <- predict(h2odt_md, h2odt)
+          AllScore <- as.data.frame(AllScore)
+          AllScore$score <- unlist(hm_all$score)
+
+          # Empirical FDR curve
+          FDRtemp <- AllScore[order(AllScore$predict, decreasing = TRUE),]
+          wh <- which(FDRtemp$score == 0)
+          fdr <- 1:length(wh) / wh
+
+          FDRCount <- sapply(seq(0,1,by = 0.01), function(x){
+            c(sum(FDRtemp$predict < x), 0, x)
+          })
+          FDRCount <- t(FDRCount)
+
+          pdf(pdfname <- paste(".", xname, "Scores_Comparisson.pdf", sep = "/"))
+          plot(FDRCount[,3], FDRCount[,1], type = "l", xlab = "FDR", ylab = "FDR", xlim = c(0, 0.2), main = "Peak FDR")
+          grid()
+          points(FDRCount[,3], FDRCount[,2], type = "l", col = 2)
+          abline(v = 0.01)
+          abline(0, 1)
+
+          plot(FDRtemp$predict[wh], fdr, type = "l", main = "Score", lwd = 5)
+          abline(h = 0.01)
+
+          dt_fdr <- data.table(score = FDRtemp$predict[wh], fdr = fdr, cut = cut(FDRtemp$predict[wh], 1000))
+          dt_fdr <- dt_fdr[, .(score = mean(score), fdr = mean(fdr)), cut]
+          FDRPREDICt <- loess(c(dt_fdr$fdr, rep(0,10)) ~ c(dt_fdr$score, 1.1:10.1), span = 0.3)
+          so <- order(FDRPREDICt$x)
+          points(FDRPREDICt$x[so], FDRPREDICt$fitted[so], type = "l", col = 2, lty = "solid", lwd = 2)
+          abline(h = 0.01)
+          abline(h = 0.05)
+          abline(h = 0.1)
+
+          h2o.varimp_plot(h2odt_md)
+
+          FDR <- predict(FDRPREDICt, AllScore$predict)
+          FDR <- FDR[hm_all$score == 1]
+          FDR[FDR < 0] <- 0
+
+          hm$FDR_RF <- FDR
+          hm$FDR_DL <- -1
+
+          IsoFrac_PeakResults <- hm
+          IsoFrac_PeakResults_random <- hm_rev
+          dev.off()
+
+          save(IsoFrac_PeakResults, IsoFrac_PeakResults_random, file = Isopath)
+        }else{
+          load(Isopath)
+        }
+
+        # Store the peak results back in the input object
+        input$IsoFrac_PeakResultsTable <- IsoFrac_PeakResults
+        input$IsoFrac_PeakResultsTable_random <- IsoFrac_PeakResults_random
+
+        # Clip extreme fraction predictions to remain in the valid gel range
+        input$IsoFrac_PeakResultsTable$Fraction_lm[input$IsoFrac_PeakResultsTable$Fraction_lm < -1] <- -1
+        input$IsoFrac_PeakResultsTable$Fraction_lm[input$IsoFrac_PeakResultsTable$Fraction_lm > 29] <- 29
+
+        input$IsoFrac_PeakResultsTable$Fraction_BS_lo[input$IsoFrac_PeakResultsTable$Fraction_BS_lo < -3] <- -3
+        input$IsoFrac_PeakResultsTable$Fraction_BS_hi[input$IsoFrac_PeakResultsTable$Fraction_BS_hi > 31] <- 31
+
+        input$IsoFrac_PeakResultsTable_random$Fraction_lm[input$IsoFrac_PeakResultsTable_random$Fraction_lm < -1] <- -1
+        input$IsoFrac_PeakResultsTable_random$Fraction_lm[input$IsoFrac_PeakResultsTable_random$Fraction_lm > 29] <- 29
+
+        input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo[input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo < -3] <- -3
+        input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi[input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi > 31] <- 31
+
+        # Load the gel-specific fraction->MW model trained in the compiler step
+        if(!exists("Models")){
+          load("../IsoFracCompiler/MW_Models_v3.rda")
+        }
+
+        Models.i <- Models[[which(input$xname == names(Models))]]
+        FractionShift = 0
+
+        # Predict MW and MW uncertainty from fraction position
+        input$IsoFrac_PeakResultsTable$MW_lm      <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm))
+        input$IsoFrac_PeakResultsTable$MW_lm_hi   <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_hi))
+        input$IsoFrac_PeakResultsTable$MW_lm_lo   <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_lo))
+
+        input$IsoFrac_PeakResultsTable$MW_lm_gel_hi <- predict(Models.i$MW_Predictor_addon$hi, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+        input$IsoFrac_PeakResultsTable$MW_lm_gel_lo <- predict(Models.i$MW_Predictor_addon$lo, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+
+        input$IsoFrac_PeakResultsTable$MW_fr      <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+        input$IsoFrac_PeakResultsTable$MW_fr_hi   <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_hi) + FractionShift)
+        input$IsoFrac_PeakResultsTable$MW_fr_lo   <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_lo) + FractionShift)
+
+        input$IsoFrac_PeakResultsTable$MW_fr_gel_hi <- predict(Models.i$MW_Predictor_addon$hi, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+        input$IsoFrac_PeakResultsTable$MW_fr_gel_lo <- predict(Models.i$MW_Predictor_addon$lo, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+
+        # Same MW predictions for the randomized control table
+        input$IsoFrac_PeakResultsTable_random$MW_lm      <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm))
+        input$IsoFrac_PeakResultsTable_random$MW_lm_hi   <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi))
+        input$IsoFrac_PeakResultsTable_random$MW_lm_lo   <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo))
+
+        input$IsoFrac_PeakResultsTable_random$MW_lm_gel_hi <- predict(Models.i$MW_Predictor_addon$hi, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+        input$IsoFrac_PeakResultsTable_random$MW_lm_gel_lo <- predict(Models.i$MW_Predictor_addon$lo, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+
+        input$IsoFrac_PeakResultsTable_random$MW_fr      <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+        input$IsoFrac_PeakResultsTable_random$MW_fr_hi   <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi) + FractionShift)
+        input$IsoFrac_PeakResultsTable_random$MW_fr_lo   <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo) + FractionShift)
+
+        input$IsoFrac_PeakResultsTable_random$MW_fr_gel_hi <- predict(Models.i$MW_Predictor_addon$hi, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+        input$IsoFrac_PeakResultsTable_random$MW_fr_gel_lo <- predict(Models.i$MW_Predictor_addon$lo, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+
+        # ----------------------------------------------------------------------------
+        # Compress nearby peak candidates into one IsoFrac protein isoform candidate
+        # when they overlap in MW / fraction space.
+        # ----------------------------------------------------------------------------
+        cl <- makeCluster(2, outfile = "")
+        print("Started Compilation of PeakIdentityList.")
+
+        ipr_PeakIdentityList <- lapply(list(input$IsoFrac_PeakResultsTable,
+                                            input$IsoFrac_PeakResultsTable_random), function(ipr){
+
+          ipr <- as.data.table(ipr)
+          library(igraph)
+          ipr_PeakIdentity <- ipr[,{
+            cat("\r", .BY$ENS)
+            temp <- .SD
+            temp$id <- 1:dim(temp)[1]
+
+            # Build a graph where peaks are connected if they are close in MW
+            Lapi <- lapply(1:dim(temp)[1], function(it){
+              i <- temp[it,]
+              check <- temp[-it,]
+              lifu <- c(unlist(check$Fraction_lm) - unlist(i$Fraction_lm))
+
+              # Only connect peaks that are close in fraction / MW
+              tempMix <- check[abs(lifu) < 1,]
+
+              if(dim(tempMix)[1] > 0){
+                re <- cbind(
+                  unlist(i$Fraction_lm),
+                  unlist(tempMix$Fraction_lm),
+                  max(abs(lifu)[abs(lifu) < 10], na.rm = TRUE),
+                  unlist(i$Height),
+                  unlist(i$Peak),
+                  unlist(i$Start),
+                  unlist(i$End),
+                  unlist(i$Fraction_lm),
+                  unlist(i$Height_lm),
+                  unlist(i$Fraction_BS_hi),
+                  unlist(i$Fraction_BS_lo),
+                  unlist(i$cluster2),
+                  unlist(i$Fraction_sd_80)
+                )
+                re <- data.frame(re)
+              }else{
+                re <- cbind(
+                  i$Fraction_lm, i$Fraction_lm, 0,
+                  unlist(i$Height),
+                  unlist(i$Peak),
+                  unlist(i$Start),
+                  unlist(i$End),
+                  unlist(i$Fraction_lm),
+                  unlist(i$Height_lm),
+                  unlist(i$Fraction_BS_hi),
+                  unlist(i$Fraction_BS_lo),
+                  unlist(i$cluster2),
+                  unlist(i$Fraction_sd_80)
+                )
+              }
+              re
+            })
+
+            Netfun <- rbindlist(Lapi)
+            g <- graph_from_data_frame(d = Netfun)
+            g <- as.undirected(g)
+
+            # Collapse connected components / cliques into one compressed MW variant
+            MaxCliques <- maximal.cliques(g)
+            le <- lapply(1:length(MaxCliques), function(x){
+              data.table(as.numeric(attributes(MaxCliques[[x]])$names), x)
+            })
+            le <- rbindlist(le)
+            colnames(le) <- c("Fraction", "PeakIdentity")
+            Mapping <- le[, paste(PeakIdentity, collapse = "_"), Fraction]
+            temp$Compressed_MW_Variants <- Mapping$V1[match(temp$Fraction_lm, Mapping$Fraction)]
+            temp
+          }, ENS]
+
+          # Summarize the compressed peak family by mean / SD MW
+          ipr_PeakIdentity[, c("MW_lm_Compressed_", "MW_lm_Compressed_sd") := {
+            temp <- .SD
+            list(
+              as.double(mean(unlist(temp$MW_lm), na.rm = TRUE)),
+              as.double(sd(unlist(temp$MW_lm), na.rm = TRUE))
+            )
+          }, .(ENS, Compressed_MW_Variants)]
+
+          ipr_PeakIdentity
+        })
+
+        stopCluster(cl)
+
+        input$IdentifiedPeaks_Table <- ipr_PeakIdentityList[[1]]
+        input$IdentifiedPeaks_Table_random <- ipr_PeakIdentityList[[2]]
+
+        print("Finished Compilation of PeakIdentityList.")
+        save(input, file = rdapath)
+      })
+
+    }else{
+      PeakFinder <- try({ load(rdapath) })
+    }
+
+    print(paste("Loaded PeakfinderData from", file.info(rdapath)$mtime))
+
+    if(class(PeakFinder) == "try-error"){
+      print("!!! WARNING !!!")
+      print("Problems in PeakFinder")
+      print(input$xname)
+    }
+
+    input
+  })
+
+  # Save the full result list for later use
+  save(TableListNormEnsHdbScanMW_Peaks, file = "TableListNormEnsHdbScanMW_Peaks9_newAlg.rda")
+}
+
+```
+
+### PeakFinderRepair
+
+- rerunning after Ens_list.rda and combination of cl2 and cl3
+
+```{r PeakFinder}
+### PeakFinderRepair
+# Re-run PeakFinder after loading the previously saved ENS_List objects
+# and after combining the cl_2 / cl_3 peak-candidate sets.
+# This step rebuilds the final IsoFrac peak tables, assigns MW estimates,
+# and compresses overlapping peak calls into protein isoform candidates.
+
+options(warn = -1)
+h2o.shutdown()
+h2o.init()
+
+TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_noSeq_noMD, function(input){
+
+  # Return to the main working directory for each gel/experiment
+  setwd(MainWD)
+
+  print("Analysing")
+  print(input$xname)
+
+  input <- input
+
+  # Create a gel-specific analysis folder
+  xname <- gsub(".txt$", "", make.names(input$xname))
+  xname <- paste("h2o_FDR_PeakFinder", xname, sep = "_")
+
+  if(rerun & file.exists(xname)){
+    # Optional cleanup of previous run directory could be placed here
+  }
+
+  dir.create(xname)
+  setwd(xname)
+  print(getwd())
+
+  # HDBSCAN outputs:
+  #   li1 = randomized control
+  #   li2 = real data
+  li1 <- input$hdbscanTables_random
+  li2 <- input$hdbscanTables
+  il  <- input$hdbscanTables
+
+  # Gene list for this gel
+  ens_vector <- unique(input$dt_gn$ens)
+
+  # Output file for this gel-specific repaired PeakFinder run
+  xname <- input$xname
+  rdapath <- paste(".", "PeakFinder_Subset.rda", sep = "/")
+
+  file.exists(rdapath)
+  rerun <- TRUE
+
+  if(!file.exists(rdapath) | rerun){
+    PeakFinder <- try({
+
+      graphics.off()
+      library(parallel)
+
+      # Load the previously generated gene-wise peak lists
+      # (real and randomized, cl_2 and cl_3 versions)
+      try({
+        hu <- load("ENS_List.rda")
+      })
+
+      # Rebuild peak tables from the saved ENS_List objects
+      Isopath <- "IsoFrac_PeakResults.rda"
+
+      if(!file.exists(Isopath) | rerun){
+
+        # ----------------------------------------------------------------------
+        # Combine peak candidates from:
+        #   - real data, cl_2
+        #   - real data, cl_3
+        #   - randomized control, cl_2
+        #   - randomized control, cl_3
+        # ----------------------------------------------------------------------
+
+        hm <- rbindlist(ENS_List[lengths(ENS_List) > 18], fill = TRUE)
+        hm <- as.data.frame(hm)
+        hm$PeakfinderSet <- "Cl_2"
+
+        hm3 <- rbindlist(ENS_List_cl_3[lengths(ENS_List_cl_3) > 18], fill = TRUE)
+        hm3 <- as.data.frame(hm3)
+        hm3$PeakfinderSet <- "Cl_3"
+
+        hm <- rbind(hm, hm3)
+
+        hm_rev <- rbindlist(ENS_List_rev[lengths(ENS_List_rev) > 18], fill = TRUE)
+        hm_rev$PeakfinderSet <- "Cl_2"
+
+        hm_rev3 <- rbindlist(ENS_List_rev_cl_3[lengths(ENS_List_rev_cl_3) > 18], fill = TRUE)
+        hm_rev3$PeakfinderSet <- "Cl_3"
+
+        hm_rev <- rbind(hm_rev, hm_rev3, fill = TRUE)
+
+        # Training labels for FDR estimation
+        # score = 1 : real peak candidates
+        # score = 0 : randomized peak candidates
+        hm$score <- 1
+        hm_rev$score <- 0
+
+        hm_all <- rbind(hm, hm_rev)
+        hm_all$ENS <- NULL
+        hm_all$Height_SD <- NULL
+        hm_all$Height_SD_all <- NULL
+        hm_all$Fraction_SD <- NULL
+        hm_all$Fraction_SD_all <- NULL
+        hm_all$cluster2 <- NULL
+
+        # Remove duplicated columns if present
+        colnames(hm_all)[dupl <- duplicated(colnames(hm_all))]
+        if(any(dupl)){
+          hm_all <- data.frame(hm_all)[, -dupl]
+        }
+
+        hm_all <- as.data.table(hm_all)
+
+        # Flatten nested list-columns to plain vectors
+        hm_all_temp <- apply(hm_all, 2, function(x){
+          x[lengths(x) == 0] <- NA
+          xl <- unlist(x)
+          if(length(x) != length(xl)){
+            x <<- x
+            stop()
+          }
+          xl
+        })
+
+        hm_all_temp <- data.frame(hm_all_temp)
+        hm_all_temp$score <- as.numeric(hm_all_temp$score)
+
+        # Keep the cl_2 training subset for FDR calibration
+        hmsub <- hm_all_temp[hm_all_temp$PeakfinderSet == "Cl_2",]
+        set.seed(1234)
+        hmsub$score <- jitter(hmsub$score, amount = 0.001)
+
+        hm$FDR_RF <- -1
+        hm$FDR_DL <- -1
+
+        IsoFrac_PeakResults <- hm
+        IsoFrac_PeakResults_random <- hm_rev
+
+        save(IsoFrac_PeakResults, IsoFrac_PeakResults_random, file = Isopath)
+
+      }else{
+        load(Isopath)
+      }
+
+      # Store peak tables in the input object
+      input$IsoFrac_PeakResultsTable <- IsoFrac_PeakResults
+      input$IsoFrac_PeakResultsTable_random <- IsoFrac_PeakResults_random
+
+      # ----------------------------------------------------------------------
+      # Limit predicted fractions to the valid gel range before MW conversion
+      # ----------------------------------------------------------------------
+      input$IsoFrac_PeakResultsTable$Fraction_lm[input$IsoFrac_PeakResultsTable$Fraction_lm < -1] <- -1
+      input$IsoFrac_PeakResultsTable$Fraction_lm[input$IsoFrac_PeakResultsTable$Fraction_lm > 29] <- 29
+
+      input$IsoFrac_PeakResultsTable$Fraction_BS_lo[input$IsoFrac_PeakResultsTable$Fraction_BS_lo < -3] <- -3
+      input$IsoFrac_PeakResultsTable$Fraction_BS_hi[input$IsoFrac_PeakResultsTable$Fraction_BS_hi > 31] <- 31
+
+      input$IsoFrac_PeakResultsTable_random$Fraction_lm[input$IsoFrac_PeakResultsTable_random$Fraction_lm < -1] <- -1
+      input$IsoFrac_PeakResultsTable_random$Fraction_lm[input$IsoFrac_PeakResultsTable_random$Fraction_lm > 29] <- 29
+
+      input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo[input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo < -3] <- -3
+      input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi[input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi > 31] <- 31
+
+      # Load the gel-specific fraction-to-MW model trained in the compiler step
+      if(!exists("Models")){
+        load("../IsoFracCompiler/MW_Models_v3.rda")
+        h2o.init(nthreads = 10)
+      }
+
+      Models.i <- Models[[which(input$xname == names(Models))]]
+      FractionShift <- 0
+
+      # ----------------------------------------------------------------------
+      # Convert fraction positions into estimated MWs for real peak candidates
+      # ----------------------------------------------------------------------
+      input$IsoFrac_PeakResultsTable$MW_lm <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm))
+      input$IsoFrac_PeakResultsTable$MW_lm_hi <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_hi))
+      input$IsoFrac_PeakResultsTable$MW_lm_lo <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_lo))
+
+      input$IsoFrac_PeakResultsTable$MW_lm_gel_hi <- predict(Models.i$MW_Predictor_addon$hi, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+      input$IsoFrac_PeakResultsTable$MW_lm_gel_lo <- predict(Models.i$MW_Predictor_addon$lo, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+
+      input$IsoFrac_PeakResultsTable$MW_fr <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+      input$IsoFrac_PeakResultsTable$MW_fr_hi <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_hi) + FractionShift)
+      input$IsoFrac_PeakResultsTable$MW_fr_lo <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable$Fraction_BS_lo) + FractionShift)
+
+      input$IsoFrac_PeakResultsTable$MW_fr_gel_hi <- predict(Models.i$MW_Predictor_addon$hi, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+      input$IsoFrac_PeakResultsTable$MW_fr_gel_lo <- predict(Models.i$MW_Predictor_addon$lo, unlist(input$IsoFrac_PeakResultsTable$Fraction_lm) + FractionShift)
+
+      # ----------------------------------------------------------------------
+      # Convert fraction positions into estimated MWs for randomized controls
+      # ----------------------------------------------------------------------
+      input$IsoFrac_PeakResultsTable_random$MW_lm <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm))
+      input$IsoFrac_PeakResultsTable_random$MW_lm_hi <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi))
+      input$IsoFrac_PeakResultsTable_random$MW_lm_lo <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo))
+
+      input$IsoFrac_PeakResultsTable_random$MW_lm_gel_hi <- predict(Models.i$MW_Predictor_addon$hi, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+      input$IsoFrac_PeakResultsTable_random$MW_lm_gel_lo <- predict(Models.i$MW_Predictor_addon$lo, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+
+      input$IsoFrac_PeakResultsTable_random$MW_fr <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+      input$IsoFrac_PeakResultsTable_random$MW_fr_hi <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_hi) + FractionShift)
+      input$IsoFrac_PeakResultsTable_random$MW_fr_lo <- predict(Models.i$MW_Predictor, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_BS_lo) + FractionShift)
+
+      input$IsoFrac_PeakResultsTable_random$MW_fr_gel_hi <- predict(Models.i$MW_Predictor_addon$hi, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+      input$IsoFrac_PeakResultsTable_random$MW_fr_gel_lo <- predict(Models.i$MW_Predictor_addon$lo, unlist(input$IsoFrac_PeakResultsTable_random$Fraction_lm) + FractionShift)
+
+      # ----------------------------------------------------------------------
+      # Build a peak-identity network:
+      # nearby peaks in fraction / MW space are grouped and collapsed into
+      # a single compressed MW variant (protein isoform candidate).
+      # ----------------------------------------------------------------------
+      cl <- makeCluster(2, outfile = "")
+      print("Started Compilation of PeakIdentityList.")
+
+      ipr_PeakIdentityList <- parLapply(
+        cl,
+        list(input$IsoFrac_PeakResultsTable, input$IsoFrac_PeakResultsTable_random),
+        function(ipr){
+          ipr <<- ipr
+
+          library(data.table)
+          ipr <- as.data.table(ipr)
+          library(igraph)
+
+          ipr_PeakIdentity <- ipr[,{
+            cat("\r", .BY$ENS)
+
+            temp <- .SD
+            temp$id <- 1:dim(temp)[1]
+            temp[,{
+              temp2 <- .SD
+            }, id]
+
+            Lapi <- lapply(1:dim(temp)[1], function(it){
+              i <- temp[it,]
+
+              # Keep peak rows robust to empty Height fields
+              if(lengths(i$Height)[1] == 0){
+                i$Height <- list(-1)
+              }
+
+              check <- temp[-it,]
+              lifu <- c(unlist(check$Fraction_lm) - unlist(i$Fraction_lm))
+
+              # Connect only peaks that are close enough in MW / fraction space
+              tempMix <- check[abs(lifu) < 1,]
+
+              if(dim(tempMix)[1] > 0){
+                re <- cbind(
+                  unlist(i$Fraction_lm),
+                  unlist(tempMix$Fraction_lm),
+                  max(abs(lifu)[abs(lifu) < 10], na.rm = TRUE),
+                  unlist(i$Height),
+                  unlist(i$Peak),
+                  unlist(i$Start),
+                  unlist(i$End),
+                  unlist(i$Fraction_lm),
+                  unlist(i$Height_lm),
+                  unlist(i$Fraction_BS_hi),
+                  unlist(i$Fraction_BS_lo),
+                  unlist(i$cluster2),
+                  unlist(i$Fraction_sd_80)
+                )
+                re <- data.frame(re)
+              }else{
+                re <- cbind(
+                  i$Fraction_lm,
+                  i$Fraction_lm,
+                  0,
+                  unlist(i$Height),
+                  unlist(i$Peak),
+                  unlist(i$Start),
+                  unlist(i$End),
+                  unlist(i$Fraction_lm),
+                  unlist(i$Height_lm),
+                  unlist(i$Fraction_BS_hi),
+                  unlist(i$Fraction_BS_lo),
+                  unlist(i$cluster2),
+                  unlist(i$Fraction_sd_80)
+                )
+                re <- data.frame(re)
+              }
+
+              re
+            })
+
+            Netfun <- rbindlist(Lapi)
+            g <- graph_from_data_frame(d = Netfun)
+            g <- as.undirected(g)
+
+            # Collapse connected peaks into clique-like peak families
+            MaxCliques <- maximal.cliques(g)
+            le <- lapply(1:length(MaxCliques), function(x){
+              data.table(as.numeric(attributes(MaxCliques[[x]])$names), x)
+            })
+            le <- rbindlist(le)
+            colnames(le) <- c("Fraction", "PeakIdentity")
+
+            Mapping <- le[, paste(PeakIdentity, collapse = "_"), Fraction]
+            temp$Compressed_MW_Variants <- Mapping$V1[match(temp$Fraction_lm, Mapping$Fraction)]
+            temp
+          }, ENS]
+
+          # Summarize each compressed MW variant by mean and SD
+          ipr_PeakIdentity[, c("MW_lm_Compressed_", "MW_lm_Compressed_sd") := {
+            temp <- .SD
+            list(
+              as.double(mean(unlist(temp$MW_lm), na.rm = TRUE)),
+              as.double(sd(unlist(temp$MW_lm), na.rm = TRUE))
+            )
+          }, .(ENS, Compressed_MW_Variants)]
+
+          ipr_PeakIdentity
+        }
+      )
+
+      stopCluster(cl)
+
+      input$IdentifiedPeaks_Table <- ipr_PeakIdentityList[[1]]
+      input$IdentifiedPeaks_Table_random <- ipr_PeakIdentityList[[2]]
+
+      print("Finished Compilation of PeakIdentityList.")
+      save(input, file = rdapath)
+
+    })
+
+  }else{
+    PeakFinder <- try({ load(rdapath) })
+  }
+
+  print(paste("Loaded PeakfinderData from", file.info(rdapath)$mtime))
+
+  if(class(PeakFinder) == "try-error"){
+    print("!!! WARNING !!!")
+    print("Problems in PeakFinder")
+    print(input$xname)
+  }
+
+  input
+})
+
+
+
+options(warn = 1)
+
+
+# Add peptide counts per HDBSCAN cluster for quick QC
+TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+  x$hdbscanTables[, PeptidesPerCluster := length(unique(Seq)), .(EnsG, cl_2)]
+  x
+})
+
+setwd(MainWD)
+save(TableListNormEnsHdbScanMW_Peaks, file = "TableListNormEnsHdbScanMW_Peaks9_newAlg.rda")
+
+
+```
+
+## Renaming of gels
+
+```{r Renaming}
+# ------------------------------------------------------------------------------
+# Rename gels / experiments to compact labels used throughout the manuscript.
+# This step ensures that the final output object uses consistent experiment names
+# (e.g. "Exp1_5per_Try") rather than the raw MaxQuant file paths.
+# ------------------------------------------------------------------------------
+
+# Relevant gel inputs (raw MaxQuant peptide.txt paths)
+gels <- c(
+  "txt_2021_01_30_TMTpro_5er_MBR/peptides.txt",
+  "txt_2020_12_23_TMTpro_8per_MBR/peptides.txt",
+  "txt_2020_12_23_TMTpro_10per_MBR/peptides.txt"
+)
+
+# Short labels used in figures, tables, and viewer output
+gelNames <- c(
+  "Exp1_5per_Try",
+  "Exp1_8per_Try",
+  "Exp1_10per_Try"
+)
+
+# Current experiment names stored in the PeakFinder result list
+s <- sapply(TableListNormEnsHdbScanMW_Peaks, function(x){ x$xname })
+
+# Only rename if all expected file names are present
+if(all(!is.na(match(s, gels)))){
+  TableListNormEnsHdbScanMW_Peaks <- lapply(seq_along(gels), function(it){
+    print(it)
+    sel <- which(s == gels[[it]])
+
+    input <- TableListNormEnsHdbScanMW_Peaks[[sel]]
+    input$xname_original <- input$xname
+    input$xname <- gelNames[it]
+
+    input
+  })
+} else {
+  print("No renaming possible. Either names were not set correctly or data was already renamed.")
+}
+
+# Show the original names for verification
+print(s)
+
+```
+
+
+
+## Isoform candidate summary across experiments
+
+This section summarizes the number of detected IsoFrac protein isoform candidates per gene across the different gels/experiments. We first merge the final peak tables from all experiments and then count high-confidence candidates after filtering by peak FDR and peak width. The resulting gene-by-experiment matrix is shown as a heatmap to illustrate how often each gene yields one or more protein isoform candidates.
+
+In a second step, we build a simple network representation in which nodes correspond to estimated molecular weights and experiments. This visualization helps show whether the same gene produces similar MW-resolved candidates across gels and whether candidate detection is reproducible between experiments.
+
+Low-confidence or very broad peaks are excluded from these summaries to keep the visualization focused on the most reliable protein isoform candidates.
+
+```{r Compilation of IdentifiedPeaks_Tables and Network}
+# ------------------------------------------------------------------------------
+# Summarize detected protein isoform candidates across gels / experiments
+# and visualize how many are found per gene and per experiment.
+# ------------------------------------------------------------------------------
+
+# Sanity check: search specificity in the first dataset
+table(TableListNormEnsHdbScanMW_Peaks[[1]]$InputTable$SearchSpecificity)
+
+# Combine all peak tables and keep track of the originating gel
+l <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+  xp <- x$IdentifiedPeaks_Table
+  xp$gel <- x$xname
+  xp
+})
+
+la <- rbindlist(l)
+# fwrite(la, "Isofrac_V3_IdentifiedPeaksTable_Combined.txt", sep = "\t")
+
+# --------------------------------------------------------------------------
+# Count isoform candidates per gene and experiment
+# --------------------------------------------------------------------------
+IsoformCountS <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+  x <<- x
+  print(x$xname)
+
+  IP <- x$IdentifiedPeaks_Table
+
+  # Keep only high-confidence candidates
+  IP <- IP[FDR_RF < 0.01,]
+  IP <- IP[unlist(Fraction_width) < 2,]
+
+  # Count unique compressed MW variants per gene
+  IP <- IP[grep(";", ENS, invert = TRUE), {
+    list(
+      MWlog10 = unique(MW_lm_Compressed_),
+      mpw = -10,
+      maxFracWidth = max(unlist(Fraction_width), na.rm = TRUE),
+      MW_lm_lo = median(MW_lm_lo),
+      MW_lm_hi = median(MW_lm_lo)
+    )
+  }, ENS]
+
+  IP$Experiment <- x$xname
+  IP
+})
+
+# Combine counts across experiments
+IsoformCountTable <- rbindlist(IsoformCountS)
+
+# Wide matrix: genes x experiments
+E <- dcast(IsoformCountTable, ENS ~ Experiment, value.var = "V1")
+E <- as.data.frame(E)
+ENS <- E$ENS
+E$ENS <- NULL
+E[is.na(E)] <- 0
+E <- apply(E, 2, as.numeric)
+
+# Cap very large values for visualization
+library(gplots)
+E[E > 5] <- 6
+my_colors <- colorRampPalette(c("grey", "turquoise4", "red"))
+
+# Clean experiment names for plotting
+colnames(E) <- gsub("/peptides.txt", "", colnames(E))
+colnames(E) <- gsub("/peptides_TryChymCOMBINED.txt", "_ChyTry", colnames(E))
+
+# Heatmap of isoform candidate counts per gene and experiment
+heatmap.2(E, scale = "none", trace = "none", col = my_colors,
+          margins = c(12, 0.1), srtCol = 30)
+
+# Restore shorter, unique column names
+colnames(E) <- make.unique(gsub(".*._", "", colnames(E)))
+
+# --------------------------------------------------------------------------
+# Gene annotation table for later plotting
+# --------------------------------------------------------------------------
+dt_gn <- rbindlist(lapply(TableListNormEnsHdbScanMW_Peaks, function(x){ x$dt_gn }))
+dt_gn <- unique(dt_gn)
+
+UniMapi <- dt_gn[, { gn[1] }, ens]
+
+# --------------------------------------------------------------------------
+# Build a second summary table for MW/network visualization
+# - keeps only strong candidates
+# - excludes wide peaks
+# - stores estimated MW and uncertainty
+# --------------------------------------------------------------------------
+IsoformCount <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+  x <<- x
+  IP <- x$IdentifiedPeaks_Table
+  IP <- IP[FDR_RF < 0.01,]
+  IP <- IP[unlist(Fraction_width) < 2,]
+
+  IP <- IP[grep(";", ENS, invert = TRUE), {
+    list(
+      MWlog10 = unique(MW_lm_Compressed_),
+      mpw = -10,
+      maxFracWidth = max(unlist(Fraction_width), na.rm = TRUE),
+      MW_lm_lo = median(MW_lm_lo),
+      MW_lm_hi = median(MW_lm_lo)
+    )
+  }, ENS]
+
+  IP$Experiment <- x$xname
+  IP
+})
+
+IsoformCountTable <- rbindlist(IsoformCount)
+
+# Standardize experiment labels
+table(IsoformCountTable$Experiment)
+IsoformCountTable$Experiment <- gsub("/peptides.txt", "", IsoformCountTable$Experiment)
+IsoformCountTable$Experiment <- gsub("/peptides_TryChymCOMBINED.txt", "_ChyTry", IsoformCountTable$Experiment)
+IsoformCountTable$Experiment <- gsub("2020_12_23_TMTpro_", "gel1_", IsoformCountTable$Experiment)
+IsoformCountTable$Experiment <- gsub("2021_10_09_TM.*.pro_", "gel2_", IsoformCountTable$Experiment)
+table(IsoformCountTable$Experiment)
+
+# Exclude standalone gels if needed
+IsoformCountTable <- IsoformCountTable[is.na(match(IsoformCountTable$Experiment, c("gel2_8per", "gel2_8per_Chymo")))]
+table(IsoformCountTable$Experiment)
+
+# --------------------------------------------------------------------------
+# Plot a gene-by-experiment network:
+# nodes represent estimated MW values and experiments
+# --------------------------------------------------------------------------
+library(igraph)
+
+if(!file.exists("Isofrac_MW_graphs.pdf") | rerun){
+  pdf("Isofrac_MW_graphs.pdf")
+
+  for(i in unique(IsoformCountTable$ENS)){
+    cat("\r", i)
+    gn <- UniMapi$V1[UniMapi$ens == i]
+
+    Temp <- IsoformCountTable[ENS == i]
+    Temp$ENS <- NULL
+
+    # Estimate MW for each candidate by using the MW range from the fit
+    Temp$MW <- apply(Temp, 1, function(x){
+      sel <- Temp$MWlog10[
+        Temp$MWlog10 >= as.numeric(x[names(x) == "MW_lm_lo"]) &
+        Temp$MWlog10 <= as.numeric(x[names(x) == "MW_lm_hi"])
+      ]
+      sel <- c(as.numeric(x[1]), sel)
+      median(sel)
+    })
+
+    Temp$MW <- round(10^round(Temp$MW, 2), -3)
+
+    g <- graph_from_data_frame(as.data.frame(Temp)[, c("MW", "Experiment")])
+
+    vertices <- V(g)
+    shape <- sapply(names(vertices), function(x){
+      xu <- lapply(c("10per", "8per", "5per"), grep, x)
+      fu <- which(xu > 0)
+      if(length(fu) == 0) fu <- 0
+      fu
+    })
+
+    col <- shape
+    col[col == 0] <- "grey"
+    V(g)$color <- col
+    V(g)$border <- "transparent"
+    V(g)$shape <- c("circle", "square")[(shape != 0) + 1]
+
+    wi <- as.numeric(names(V(g)))
+    wi[is.na(wi)] <- 100000
+    V(g)$size <- wi / max(wi) * 30
+    V(g)$bg <- "transparent"
+
+    plot(
+      g,
+      main = paste(i, paste(substr(gn, 1, 20), "..."), sep = "\n"),
+      vertex.frame.color = "transparent"
+    )
+  }
+
+  dev.off()
+  system("open ./Isofrac_MW_graphs.pdf")
+}
+save(TableListNormEnsHdbScanMW_Peaks,file="TableListNormEnsHdbScanMW_Peaks_NW.rda")
+
+```
+
+## Peak quality model training
+
+To train an experimental peak-quality model, we simulated simple peak shapes with different widths and compared them to poor or random traces. Each example was reduced to a small fixed set of points around the peak center and scaled to make shapes comparable. These synthetic patterns were then used to build a labeled training set for peak-quality prediction in the IsoFrac PeakFinder pipeline.
+
+```{r Peak Quality Model}
+## Peak Quality Model (Experimental)
+# This section builds a small simulated training set of peak shapes.
+# The goal is to distinguish well-shaped IsoFrac peaks from poor or random shapes.
+# These simulated examples are later used to train a peak-quality classifier.
+
+TrainingData <- c()
+allowed_Fraction_Width <- seq(1, 6, by = 0.05)
+
+# Scale a profile to make shapes comparable before training
+scalefunction <- function(x, type = "median"){
+  if(type == "scale"){
+    x <- scale(x)
+  }
+  if(type == "max"){
+    x <- x - min(x, na.rm = TRUE)
+    x <- x / max(x, na.rm = TRUE)
+  }
+  if(type == "median"){
+    x <- x - min(x, na.rm = TRUE)
+    x <- x / median(x, na.rm = TRUE)
+  }
+  x
+}
+
+typeset <- "max"
+
+# Generate synthetic peak-like traces of different widths
+for(jitterFac in seq(0, 0)){
+  plot(1, type = "n", xlim = c(-10, 10), ylim = c(-2, 2))
+
+  for(u in 1){
+    for(i in allowed_Fraction_Width){
+      sd <- i
+      xvec <- seq(-10, 10, 1)
+      mu <- 0
+
+      # Simulated Gaussian-like peak
+      yvec <- sapply(xvec, function(x){
+        1 / sd * (2 * 3.14)^0.5 * exp(1)^(-0.5 * ((x - mu)^2 / (2 * sd)^2))
+      })
+
+      cu <- list(x = xvec, y = yvec)
+
+      # Optional jitter to make the simulated peak less idealized
+      cu$y <- jitter(cu$y, amount = jitterFac)
+      cu$y <- scalefunction(cu$y, type = typeset)
+
+      points(cu$x, cu$y, type = "l", col = "#99999940")
+
+      # Extract a reduced 7-point representation of the peak shape
+      xvec <- c(-8, -4, -2, 0, 2, 4, 8)
+
+      yvec <- sapply(xvec, function(x){
+        cu$y[abs(cu$x - x) == min(abs(cu$x - x))]
+      })
+      yvec <- scalefunction(yvec, type = typeset)
+
+      # Random background-like trace for negative examples
+      yvecrandom <- jitter(rep(0.5, 7), amount = 0.1)
+      yvecrandom <- scalefunction(yvecrandom, type = typeset)
+
+      # Positive example: good peak
+      points(xvec, yvec, col = 2, type = "l")
+      TrainingData <- rbind(TrainingData, c(yvec, i, jitterFac, 1))
+
+      # Negative example: inverted / poor peak
+      TrainingData <- rbind(TrainingData, c(-yvec + 1, i, jitterFac, -1))
+      points(xvec, -yvec + 1, col = 3, type = "l")
+
+      # Neutral / random example
+      TrainingData <- rbind(TrainingData, c(yvecrandom, -10, jitterFac, 0))
+      points(xvec, yvecrandom, col = 4, type = "l")
+    }
+  }
+}
+```
+
+
+### Peak quality scoring
+
+To reduce false-positive peak calls, we trained a peak-quality classifier on simulated peak-like traces and random background traces. The classifier evaluates a short window around each detected peak and assigns a score based on how closely the observed shape resembles a well-formed peak. These scores are then added to the final IsoFrac peak tables and used as an additional quality filter for protein isoform candidates.
+
+```{r Applying PeakQuality,fig.show='hold',out.width="50%",fig.cap="Peak Score distributions using Random Forest or DeepLearning Model"}
+## Applying PeakQuality model
+# Train the peak-quality models and predict scores for all IsoFrac candidates.
+# The real candidate peaks are then scored against a model trained on simulated
+# good and bad peak shapes.
+
+if(!file.exists("TableListNormEnsHdbScanMW_Peaks_NW_PR.rda") | rerun){
+
+  colnames(TrainingData) <- c(rep("V", 7), "i", "jitter", "Group")
+  TrainingData <- as.data.frame(TrainingData)
+  colnames(TrainingData) <- make.unique(colnames(TrainingData))
+
+  h2o.init()
+
+  # Use only the shape features for model training
+  train <- TrainingData[, 1:7]
+  train$Score <- TrainingData$Group
+  plot(density(train$Score, bw = 0.01))
+
+  trainh2o <- as.h2o(train)
+
+  # Random Forest is the main peak-quality model
+  md_rf <- h2o.randomForest(training_frame = trainh2o, y = "Score", nfolds = 20)
+
+  # Deep Learning was also trained for comparison
+  md_ml <- h2o.deeplearning(training_frame = trainh2o, y = "Score", nfolds = 20)
+
+  h2o::h2o.varimp_heatmap(list(md_ml, md_rf))
+
+  # ------------------------------------------------------------------------
+  # Predict peak quality for each IsoFrac candidate
+  # ------------------------------------------------------------------------
+  TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_Peaks, function(input){
+    print(input$xname)
+
+    Iso_PRT <- data.table(input$IsoFrac_PeakResultsTable)
+    hdbst <- input$hdbscanTables
+
+    # Match each peak to the cluster assignment used in the current PeakFinder run
+    Iso_PRT[, UsedClusters := {
+      gr_0 <- .BY
+      temp_0 <- .SD
+
+      if(gr_0$PeakfinderSet == "Cl_2"){
+        temp_0$UsedClusters <- temp_0$cluster2
+        hdbst$UsedClusters <- hdbst$cl_2
+      }else{
+        temp_0$UsedClusters <- temp_0$cluster2
+        hdbst$UsedClusters <- hdbst$cl_3
+      }
+
+      temp_0$UsedClusters
+    }, .(ENS, PeakfinderSet)]
+
+    # Extract a 7-fraction window around each peak and scale it for scoring
+    Iso_PRT_Table <- Iso_PRT[,{
+      gr_0 <- .BY
+      temp_0 <- .SD
+
+      r <- temp_0[,{
+        temp <- .SD
+        gr <- .BY
+
+        Zsc <- input$TMTSubset_final_singlenorm_zscore[hdbst[EnsG == gr_0$ENS]$id]
+        Zsc <- data.frame(Zsc)
+
+        RESULTS <- lapply(temp$Peak, function(peak){
+          Selfun <- c((peak - 3):peak, (peak:(peak + 3))[-1])
+          Selfun[is.na(match(Selfun, 1:28))] <- NA
+
+          tempPeak <- as.matrix(Zsc)[, Selfun]
+
+          if(!is.matrix(tempPeak)){
+            tempPeak <- as.matrix(tempPeak)
+            tempPeak <- t(tempPeak)
+          }
+
+          tempPeak <- apply(tempPeak, 1, function(x){
+            scalefunction(x, type = typeset)
+          })
+          tempPeak <- t(tempPeak)
+          colnames(tempPeak) <- c("V", "V.1", "V.2", "V.3", "V.4", "V.5", "V.6")
+
+          rs <- rowSums(tempPeak + 1, na.rm = TRUE)
+          if(all(is.na(tempPeak))){
+            tempPeak <- tempPeak[1,]
+          }else{
+            tempPeak <- tempPeak[rs != 0,]
+          }
+
+          if(!is.matrix(tempPeak)){
+            tempPeak <- as.matrix(tempPeak)
+          }
+          if(dim(tempPeak)[2] == 1){
+            tempPeak <- t(tempPeak)
+          }
+
+          tempPeak <- data.frame(tempPeak)
+          tempPeak$Peak <- peak
+          tempPeak
+        })
+
+        r <- rbindlist(RESULTS)
+      }, .(UsedClusters)]
+
+      r
+    }, .(ENS, PeakfinderSet)]
+
+    # ----------------------------------------------------------------------
+    # Predict scores and summarize them per peak
+    # ----------------------------------------------------------------------
+    predi <- as.h2o(Iso_PRT_Table)
+
+    rf_predi <- as.data.frame(predict(md_rf, predi))
+    dl_predi <- as.data.frame(predict(md_ml, predi))
+
+    hist(rf_predi$predict)
+    hist(dl_predi$predict)
+
+    Iso_PRT_Table$Score_RF <- rf_predi$predict
+    Iso_PRT_Table$Score_DL <- dl_predi$predict
+
+    Iso_PRT_Table_mPeakScore <- Iso_PRT_Table[, {
+      list(
+        dl    = median(Score_DL, na.rm = TRUE),
+        rf    = median(Score_RF, na.rm = TRUE),
+        dl_80 = quantile(Score_DL, 0.8),
+        dl_20 = quantile(Score_DL, 0.2),
+        rf_80 = quantile(Score_RF, 0.8),
+        rf_20 = quantile(Score_RF, 0.2)
+      )
+    }, .(ENS, PeakfinderSet, UsedClusters, Peak)]
+
+    # Ensure the peak identifiers match between the raw table and the summary
+    PeakID <- paste(Iso_PRT$ENS, Iso_PRT$UsedClusters, Iso_PRT$PeakfinderSet, unlist(Iso_PRT$Peak))
+    PeakID2 <- paste(Iso_PRT_Table_mPeakScore$ENS, Iso_PRT_Table_mPeakScore$UsedClusters, Iso_PRT_Table_mPeakScore$PeakfinderSet, Iso_PRT_Table_mPeakScore$Peak)
+    venn(list(PeakID, PeakID2))
+
+    # Attach peak-quality summaries to the final peak table
+    Iso_PRT$PeakScore_RF    <- Iso_PRT_Table_mPeakScore$rf[match(PeakID, PeakID2)]
+    Iso_PRT$PeakScore_DL    <- Iso_PRT_Table_mPeakScore$dl[match(PeakID, PeakID2)]
+    Iso_PRT$PeakScore_RF_80 <- Iso_PRT_Table_mPeakScore$rf_80[match(PeakID, PeakID2)]
+    Iso_PRT$PeakScore_DL_80 <- Iso_PRT_Table_mPeakScore$dl_80[match(PeakID, PeakID2)]
+    Iso_PRT$PeakScore_RF_20 <- Iso_PRT_Table_mPeakScore$rf_20[match(PeakID, PeakID2)]
+    Iso_PRT$PeakScore_DL_20 <- Iso_PRT_Table_mPeakScore$dl_20[match(PeakID, PeakID2)]
+
+    input$IsoFrac_PeakResultsTable <- Iso_PRT
+    input
+  })
+
+
+  # Restore original gel names
+  TableListNormEnsHdbScanMW_Peaks <- lapply(1:length(gels), function(it){
+    input <- TableListNormEnsHdbScanMW_Peaks[[it]]
+    input$xname_original <- gels[it]
+    input$xname <- gelNames[it]
+    input
+  })
+
+  # Merge possible SUB0 labels back to zero
+  TableListNormEnsHdbScanMW_Peaks <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+    x$hdbscanTables$cl_2[x$hdbscanTables$cl_2 == "SUB0"] <- "0"
+    x$hdbscanTables$cl_2[x$hdbscanTables_random$cl_2 == "SUB0"] <- "0"
+
+    x$IsoFrac_PeakResultsTable$cluster2[x$IsoFrac_PeakResultsTable$cluster2 == "SUB0"] <- "0"
+    x$IsoFrac_PeakResultsTable_random$cluster2[x$IsoFrac_PeakResultsTable_random$cluster2 == "SUB0"] <- "0"
+
+    x
+  })
+
+  save(TableListNormEnsHdbScanMW_Peaks, file = "TableListNormEnsHdbScanMW_Peaks_NW_PR.rda")
+
+}else{
+  load("TableListNormEnsHdbScanMW_Peaks_NW_PR.rda")
+}
+
+# --------------------------------------------------------------------------
+# Quick QC plots / checks
+# --------------------------------------------------------------------------
+table(TableListNormEnsHdbScanMW_Peaks[[1]]$InputTable$SearchSpecificity)
+
+hdbscanTables <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+  xtemp <- x$hdbscanTables
+  xtemp$Abu <- as.numeric(xtemp$Abu)
+  xtemp$Gel <- x$xname
+  xtemp
+})
+
+IsoPR <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+  xtemp <- x$IsoFrac_PeakResultsTable
+  xtemp$Abu <- as.numeric(xtemp$Abu)
+  xtemp$Gel <- x$xname
+  xtemp
+})
+IsoPR <- rbindlist(IsoPR)
+
+hdbscanTables <- rbindlist(hdbscanTables)
+
+checkClusterLengths(TableListNormEnsHdbScanMW_Peaks[[1]])
+
+IsofracList <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+  x$IsoFrac_PeakResultsTable$gel <- x$xname
+  x$IsoFrac_PeakResultsTable
+})
+IsofracTab <- rbindlist(IsofracList)
+
+ggplot(IsofracTab, aes(PeakScore_DL, fill = gel)) + geom_density(alpha = 0.5) +
+  ggtitle("PeakScore Deep Learning Model") + xlab("Peak Quality Score")
+
+ggplot(IsofracTab, aes(PeakScore_RF, fill = gel)) + geom_density(alpha = 0.5) +
+  ggtitle("PeakScore Random Forest Model") + xlab("Peak Quality Score")
+
+```
+## Generating Slim Version of ListObject for IsoFracViewer
+
+-   Keeps only Plotting relevant data
+-   Improves performance of the viewer
+
+```{r Cleaning}
+## Generating slim version of the IsoFrac result object for the viewer
+# This step keeps only the fields that are needed for plotting and inspection
+# in the IsoFrac web viewer. The goal is to reduce file size and improve loading speed.
+
+print("Done Loading Data")
+
+TableListNormEnsHdbScanMW_PeaksSlim <- lapply(TableListNormEnsHdbScanMW_Peaks, function(x){
+  x <- x
+
+  # Keep only the minimal set of objects needed for visualization and summaries:
+  # - gene mapping table
+  # - normalized peptide traces
+  # - HDBSCAN clustering results
+  # - peak results
+  # - MW models
+  # - network tables
+  # - plex availability flag
+  list(
+    xname = x$xname,
+    dt_gn = x$dt_gn,
+    TMTSubset_final_singlenorm_zscore = x$TMTSubset_final_singlenorm_zscore,
+    hdbscanTables = x$hdbscanTables,
+    IsoFrac_PeakResultsTable = x$IsoFrac_PeakResultsTable,
+    MW_Predictor = x$MW_Predictor,
+    MW_Predictor_addon = x$MW_Predictor_addon,
+    IdentifiedPeaks_Table = x$IdentifiedPeaks_Table,
+    NetworkTables = x$NetworkTables,
+    InBothPlexes = x$InBothPlexes
+  )
+})
+
+# Predicted MW values for fraction numbers 1:30, used for the viewer axis
+FractionsToMWList <- lapply(Models, function(x){
+  predict(x$MW_Predictor, 1:30)
+})
+save(FractionsToMWList, file = paste(".", "FractionsToMWList.rda", sep = "/"))
+
+# Attach the predicted fraction-to-MW mapping to each slim object
+TableListNormEnsHdbScanMW_PeaksSlim <- lapply(seq_along(TableListNormEnsHdbScanMW_PeaksSlim), function(it){
+  input <- TableListNormEnsHdbScanMW_PeaksSlim[[it]]
+  predicted <- FractionsToMWList[[it]]
+  input$Fractions_predicted_MW <- predicted
+  input
+})
+
+# Restore the short gel names used throughout the manuscript and viewer
+s <- sapply(TableListNormEnsHdbScanMW_PeaksSlim, function(x){ x$xname })
+
+TableListNormEnsHdbScanMW_PeaksSlim <- lapply(seq_along(gels), function(it){
+  input <- TableListNormEnsHdbScanMW_PeaksSlim[[it]]
+  input$xname_original <- gels[it]
+  input$xname <- gelNames[it]
+  input
+})
+
+# Save the reduced object for fast loading in the IsoFrac viewer
+save(TableListNormEnsHdbScanMW_PeaksSlim, file = "./TableListNormEnsHdbScanMW_PeaksSlim.rda")
+
+print(paste(
+  "Generated TableListNormEnsHdbScanMW_PeaksSlim.rda on",
+  file.info("TableListNormEnsHdbScanMW_PeaksSlim.rda")$mtime
+))
+
+
+```
+

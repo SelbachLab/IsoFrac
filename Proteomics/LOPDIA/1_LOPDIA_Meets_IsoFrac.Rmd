@@ -1,0 +1,187 @@
+---
+title: "v3_Lopit_Meets_IsoFrac"
+author: "Henrik Zauber"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading Data
+
+
+## LOPDIA Functions
+```{r}
+suppressPackageStartupMessages({
+  library("tidyr")
+  library("tibble") 
+  library("dplyr")
+  library("ggplot2")
+  library("colorspace")
+  library("QFeatures")
+  library("MSnbase")
+  library("pRoloc")
+  library("biomaRt")
+  library("pRolocGUI")
+  })
+```
+
+```{r}
+setwd(dirname(rstudioapi::documentPath()))
+library(Rcpp)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+# Checking
+library(ggrepel)
+# hu <- load("Elli_20251006/mcmc_model_3.rda")#mcmc_model
+
+hu <- load("pep_joined_with_isofrac_3.RData")
+# updated pep_joined
+hu <- load("RPE1_DIA_markers_3.rda")#marker vector "combined"
+hu <- load("tagm_pep.RData")#another pep_joined
+# Generating PCA
+pep_pca <- pep_joined %>%
+  filterNA() %>%
+  plot2D(method = "PCA", plot = F)
+
+FD <- pep_joined@featureData@data
+pep_pca <- as.data.table(pep_pca)
+pep_pca <- cbind(pep_pca,FD)
+
+markers <- pep_pca[markers!="unknown"]
+markersCollapsed <- markers[,1,.(Protein.Group,markers,IsoFracID)]
+markersCollapsed$V1 <- NULL
+markersCollapsed$IsoFracID <- gsub(" .*.","",markersCollapsed$IsoFracID)
+markersCollapsed$Protein.Group <- gsub("_.*.","",markersCollapsed$Protein.Group)
+setnames(markersCollapsed,"IsoFracID","EnsemblGeneID")
+fwrite(markersCollapsed,"Markers_Table.txt",sep="\t")
+
+
+```
+
+## PCA Projection
+
+
+```{r}
+ggplot(pep_pca,aes(`PC1 (25.2%)`,`PC2 (18.88%)`,color=markers))+geom_point()+facet_wrap("markers")+ggtitle("All")
+ggplot(pep_pca[!is.na(IsoFrac_MW)],aes(`PC1 (25.2%)`,`PC2 (18.88%)`,color=markers))+geom_point()+facet_wrap("markers")+ggtitle("IsoFracMapped")
+
+ggplot(pep_pca[grep("P07339",Protein.Group)],aes(`PC1 (25.2%)`,`PC2 (18.88%)`,label=Stripped.Sequence,color=markers))+geom_point()+ggtitle("All")+geom_text_repel(size=2.5)
+
+ggplot(pep_pca[grep("P46108",Protein.Group)],aes(`PC1 (25.2%)`,`PC2 (18.88%)`,label=Stripped.Sequence,color=markers))+geom_point()+ggtitle("All")+geom_text_repel(size=2.5)
+
+ggplot(pep_pca[grep("P19838",Protein.Group)],aes(`PC1 (25.2%)`,`PC2 (18.88%)`,label=Stripped.Sequence,color=as.character(IsoFrac_MW)))+geom_point()+ggtitle("All")+geom_text_repel(size=2.5)
+
+
+
+
+
+
+```
+
+## PCA
+- extract data from MSnSet Object
+- run PCA seperately to get access to all PCs
+```{r}
+pep_filtered <- pep_joined %>% filterNA()
+dt <- exprs(pep_filtered)
+
+fd <- pep_joined@featureData@data
+NAMES <- combined[((match(gsub("_.*.","",fd$Protein.Group),names(combined))))]
+NAMES[is.na(NAMES)] <- "UNKNOWN"
+
+str(pep_joined)
+dtPCA  <- prcomp(pep_joined@assayData$exprs,scale. = T)
+pc <- data.table(dtPCA$x)
+pc$Marker <- NAMES
+pc$Sequence <- rownames(pep_joined@assayData$exprs)
+
+
+
+ggplot(pc,aes(PC1,PC2,color=Marker))+geom_point()+facet_wrap("Marker")
+
+
+
+#[!is.na(match(markers,c("ER","Lysosome")))]
+ggplot(pep_pca[markers!="unknown"],aes(`PC1 (25.2%)`,`PC2 (18.88%)`,color=markers))+geom_point()+ggtitle("All")+geom_point(data=pep_pca[grep("P46108",Protein.Group)],color="black",cex=3)+ggtitle("All")#+geom_text_repel(size=2.5)
+
+  
+
+
+```
+
+
+
+## Adding IsoFrac Info v1 
+
+```{r}
+library(gplots)
+#temp <- fread("fulldataset.csv")
+print("Loading UniSequences_all")
+hu <- load("./ProteinSequences_UPproteolytic_PacBio_complete.rda")
+
+print("Loading UniAcc")# protein sequence data information
+hu1 <- load("./Additional_Data/ACC_Sequences.rda")
+UniAcc <- data.table(UniAcc)
+str(UniAcc)
+
+print("Loading compiled IsoFrac Data including peptide sequences")
+
+IsoFrac_with_Sequences <- fread("./Elli_20251006/ENSG_Peptide_Isofrac_Assembly_20260408.txt")
+
+
+IsoFrac_with_Sequences$ENSG <- IsoFrac_with_Sequences$EnsG
+
+
+IsoFrac_with_Sequences[ENSG=="ENSG00000076641"]
+IsoFrac_with_Sequences[,IsoFracID:=paste(ENSG,round(MW_lm_Compressed_,-2))]
+IsoFrac_with_Sequences[hgnc_symbol=="NFKB1",paste(MW_lm_Compressed_,collapse=";"),.(Seq)]
+IsoFrac_with_Sequences[hgnc_symbol=="NFKB1"&Seq=="LEPVVSDAIYDSK"]
+IsoFrac_with_Sequences_Best <- IsoFrac_with_Sequences[,.SD[score_ref==max(score_ref_gbm,na.rm=T)],.(IsoFracID,MW_lm_Compressed_,Seq)]
+
+venn(split(IsoFrac_with_Sequences[hgnc_symbol=="TMPO"]$Seq,IsoFrac_with_Sequences[hgnc_symbol=="TMPO"]$IsoFrac_MW))
+
+print("Loading Delta Mass Categories from Delta Mass plot of PacBio vs UniProt Figure")
+DM <- load("/Users/henno/Documents/Skripte/R_Scripts/DataAnalysis/20210129_AK_ProteinIsoforms/20250821_Rebuttal/Elli_20251006/DeltaMassPlot_TemporaryExtraction_20260327.rda")
+
+tempinfo <- DeltaMassFig$data
+tempinfo[DM_min_categories=="Equal MassShift"&DM_PB_min<0]$DM_min_categories <- "Equal MassShift-"
+tempinfo[DM_min_categories=="Equal MassShift"&DM_PB_min>0]$DM_min_categories <- "Equal MassShift+"
+table(tempinfo$DM_min_categories)
+
+IsoFrac_with_Sequences_Best[,c("Uniprot_Isoform_Category","Uniprot_IsoformType","DeltaMass_Category"):={
+  
+  tempi <- .SD
+  gr <- .BY
+  tempinfoi <- tempinfo[ENSG==gr$EnsG&tempinfo$IsoFrac_MW==gr$IsoFrac_MW,,]
+  
+  li <- list(Uniprot_Isoform_Category=tempinfoi$Uniprot_Isoform_Category,
+       Uniprot_IsoformType=tempinfoi$UniprotIsoformType,
+       DeltaMass_Category=tempinfoi$DM_min_categories)
+  li <- lapply(li,paste,collapse=";")
+  li
+},.(EnsG,IsoFrac_MW)]
+
+IsoFrac_with_Sequences_Best$ENSG <- IsoFrac_with_Sequences_Best$ENS
+IsoFrac_with_Sequences_Best_Elli <- IsoFrac_with_Sequences_Best[,1,.(ENSG,hgnc_symbol,Seq,IsoFrac_MW,BestCluster,ClusterType,score_ref,Uniprot_MW,Uniprot_Isoform_Category,DeltaMass_Category)]
+IsoFrac_with_Sequences_Best_Elli$V1 <- NULL
+table(IsoFrac_with_Sequences_Best_Elli[hgnc_symbol=="TMPO"]$Seq)
+
+IsoFrac_with_Sequences_Best_Elli$DeltaMass_Category_Fac <- factor(IsoFrac_with_Sequences_Best_Elli$DeltaMass_Category,c("Equal MassShift+" ,"Equal MassShift-","Correct Mass","Other","PACBIO correct-","UniProt correct-","PACBIO correct+","UniProt correct+"),
+                                                                  c("PTMs","Putative_Processing","unknown","other","AS_or_processing","Processing","AS or PTMs","unknown")
+                                                                  )
+
+fwrite(IsoFrac_with_Sequences_Best_Elli,"IsoFrac_with_Sequences_Best_Elli.txt",sep="\t")
+
+IsoFrac_LOPIT <- cbind(IsoFrac_with_Sequences_Best_Elli,FD[match(IsoFrac_with_Sequences_Best_Elli$Seq,FD$Stripped.Sequence),],pc[match(IsoFrac_with_Sequences_Best_Elli$Seq,FD$Stripped.Sequence),])
+IsoFrac_LOPIT[hgnc_symbol=="CTSB"]
+IsoFrac_LOPIT[hgnc_symbol=="CSTB"]
+
+save(IsoFrac_LOPIT,file="IsoFrac_LOPIT_20260408.rda")
+
+```
